@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 project(carsim CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -27,9 +27,24 @@ if(NOT raygui_POPULATED)
     FetchContent_Populate(raygui)
 endif()
 
-add_executable(carsim main.cpp sim.cpp)
+# ---- Jolt Physics (built from source; CMake lives in the Build subdir) ------
+set(TARGET_UNIT_TESTS       OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD      OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES          OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER           OFF CACHE BOOL "" FORCE)
+set(OVERRIDE_CXX_FLAGS      OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    JoltPhysics
+    GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+    GIT_TAG        v5.2.0
+    SOURCE_SUBDIR  Build
+)
+FetchContent_MakeAvailable(JoltPhysics)
+
+add_executable(carsim main.cpp sim.cpp physics.cpp)
 target_include_directories(carsim PRIVATE ${raygui_SOURCE_DIR}/src)
-target_link_libraries(carsim PRIVATE raylib)
+target_link_libraries(carsim PRIVATE raylib Jolt)
 
 # copy the engine-sound asset next to the executable so it loads regardless of cwd
 add_custom_command(TARGET carsim POST_BUILD

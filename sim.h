@@ -134,6 +134,12 @@ struct Vehicle {
     std::vector<Wheel>        wheels;   // configurable wheel set
     std::vector<Differential> diffs;    // configurable couplings
 
+    // When true the chassis (body velocity v, position x, wheel loads Fz) is
+    // owned by the external 3D physics engine: step() then only advances the
+    // drivetrain (engine, clutch, gearbox, wheel spin -> tire Fx) and leaves
+    // v / Fz to be supplied from outside before each call.
+    bool external = false;
+
     Vehicle();
     void reset();                       // reset dynamic state, keep config
     void step(double dt,double throttle,double brake);

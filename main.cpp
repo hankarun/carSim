@@ -10,10 +10,12 @@
 // =============================================================================
 #include "raylib.h"
 #include "rlgl.h"
+#include "raymath.h"
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
 
 #include "sim.h"
+#include "physics.h"
 
 #include <cmath>
 #include <vector>
@@ -67,68 +69,108 @@ static void DrawPlot(Rectangle r,const Plot& p,float lo,float hi,Color col,
     DrawText(label,(int)r.x+6,(int)r.y+4,14,col);
 }
 
-// ----------------------------- 3D car scene ---------------------------------
-// Draws the configured car (body sized to the wheel layout + cylinder wheels)
-// on a scrolling grid, rendered into an off-screen texture sized to `view`.
-static void DrawCar3D(Rectangle view, const Vehicle& car, double groundScroll,
-                      int monWheel, bool spin){
+// ----------------------------- terrain --------------------------------------
+// simple analytic heightmap (rolling hills, flattened near the spawn origin)
+static float terrainH(int ix,int iz,int N){
+    float wx=((float)ix/(N-1))*2.0f-1.0f;
+    float wz=((float)iz/(N-1))*2.0f-1.0f;
+    float h = std::sin(wx*4.0f)*std::cos(wz*3.0f)*2.2f      // big rolling hills
+            + std::sin((wx+wz)*2.3f)*1.1f
+            + std::sin(wx*9.0f)*std::cos(wz*8.0f)*0.7f       // medium bumps
+            + std::cos(wx*15.0f+wz*12.0f)*0.35f;             // fine chatter
+    float d = std::sqrt(wx*wx+wz*wz);
+    float flat = (float)clampd(1.0-d*3.5,0.0,1.0);   // flat pad at the centre
+    return h*(1.0f-flat);
+}
+// build a raylib mesh from the same height samples Jolt uses (exact match)
+static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
+    Mesh m{};
+    m.vertexCount   = N*N;
+    m.triangleCount = (N-1)*(N-1)*2;
+    m.vertices = (float*)MemAlloc(m.vertexCount*3*sizeof(float));
+    m.normals  = (float*)MemAlloc(m.vertexCount*3*sizeof(float));
+    m.indices  = (unsigned short*)MemAlloc(m.triangleCount*3*sizeof(unsigned short));
+    float span=(N-1)*cell;
+    for(int iz=0;iz<N;iz++) for(int ix=0;ix<N;ix++){
+        int v=iz*N+ix;
+        m.vertices[v*3+0]=-span*0.5f+cell*ix;
+        m.vertices[v*3+1]=h[(size_t)iz*N+ix];
+        m.vertices[v*3+2]=-span*0.5f+cell*iz;
+        m.normals[v*3+0]=0; m.normals[v*3+1]=1; m.normals[v*3+2]=0;
+    }
+    int t=0;
+    for(int iz=0;iz<N-1;iz++) for(int ix=0;ix<N-1;ix++){
+        unsigned short a=iz*N+ix, b=iz*N+ix+1, c=(iz+1)*N+ix, d=(iz+1)*N+ix+1;
+        m.indices[t++]=a; m.indices[t++]=c; m.indices[t++]=b;
+        m.indices[t++]=b; m.indices[t++]=c; m.indices[t++]=d;
+    }
+    UploadMesh(&m,false);
+    return LoadModelFromMesh(m);
+}
+
+// ----------------------------- 3D scene -------------------------------------
+// Renders the heightmap + the Jolt rigid-body car (free to pitch/roll/yaw) with
+// a smoothed chase camera, into an off-screen texture sized to `view`.
+static Vector3 gCamPos = {6.0f,5.0f,8.0f};
+static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
+                        Model terrain, int monWheel, bool spin){
     static RenderTexture2D rt{};
     if(rt.id==0) rt = LoadRenderTexture((int)view.width,(int)view.height);
 
+    float bp[3]; world.bodyPosition(bp);
+    float bq[4]; world.bodyQuat(bq);
+    Quaternion q={bq[0],bq[1],bq[2],bq[3]};
+    Vector3 pos={bp[0],bp[1],bp[2]};
+    Vector3 fwd  = Vector3RotateByQuaternion({1,0,0},q);
+    Vector3 up   = Vector3RotateByQuaternion({0,1,0},q);
+    Vector3 right= Vector3RotateByQuaternion({0,0,1},q);
+
+    // chase camera: behind + above the car, smoothed
+    Vector3 want = Vector3Add(pos, Vector3Add(Vector3Scale(fwd,-7.5f),
+                                              (Vector3){0,3.6f,0}));
+    gCamPos = Vector3Lerp(gCamPos, want, 0.12f);
     Camera3D cam{};
-    cam.position   = {4.6f, 3.0f, 5.4f};
-    cam.target     = {0.0f, 0.4f, 0.0f};
-    cam.up         = {0.0f, 1.0f, 0.0f};
-    cam.fovy       = 45.0f;
-    cam.projection = CAMERA_PERSPECTIVE;
+    cam.position=gCamPos; cam.target=Vector3Add(pos,(Vector3){0,0.5f,0});
+    cam.up={0,1,0}; cam.fovy=50.0f; cam.projection=CAMERA_PERSPECTIVE;
 
     BeginTextureMode(rt);
     ClearBackground(Color{20,24,34,255});
     BeginMode3D(cam);
 
-    // --- ground: a grid that scrolls along X (the car's forward axis) -------
-    float tile = 2.0f;
-    float off  = (float)std::fmod(groundScroll, (double)tile);
+    // terrain: dark fill + wireframe to match the car's look
+    DrawModel(terrain,{0,0,0},1.0f,Color{28,36,50,255});
+    DrawModelWires(terrain,{0,0,0},1.0f,Color{54,70,92,255});
+
+    // chassis: wireframe box following the body's full orientation
+    float dims[3]; world.bodyDims(dims);
     rlPushMatrix();
-    rlTranslatef(-off, 0.0f, 0.0f);
-    DrawGrid(40, tile);
+    rlTranslatef(pos.x,pos.y,pos.z);
+    Vector3 axis; float ang; QuaternionToAxisAngle(q,&axis,&ang);
+    if(Vector3Length(axis)>0.001f) rlRotatef(ang*RAD2DEG,axis.x,axis.y,axis.z);
+    DrawCubeWires({0,0,0},dims[0],dims[1],dims[2],Color{120,150,200,255});
     rlPopMatrix();
 
-    // --- body: a simple wireframe cube enclosing the wheels ----------------
-    if(!car.wheels.empty()){
-        float minx=1e9f,maxx=-1e9f,minz=1e9f,maxz=-1e9f;
-        for(const Wheel& wh: car.wheels){
-            minx=std::min(minx,(float)wh.px); maxx=std::max(maxx,(float)wh.px);
-            minz=std::min(minz,(float)wh.pz); maxz=std::max(maxz,(float)wh.pz);
-        }
-        float cxw=(minx+maxx)*0.5f, czw=(minz+maxz)*0.5f;
-        float blen=std::max((maxx-minx)+0.6f, 1.2f);
-        float bwid=std::max((maxz-minz)+0.2f, 0.8f);
-        DrawCubeWires({cxw, 0.6f, czw}, blen, 0.8f, bwid, Color{120,150,200,255});
-    }
-
-    // --- wheels: cylinders along Z, with a spoke to show spin ---------------
-    for(int i=0;i<(int)car.wheels.size();++i){
-        const Wheel& wh=car.wheels[i];
-        float wr=(float)wh.r;
-        float ww=0.26f;                          // half-width along the axle
-        Vector3 hub = { (float)wh.px, wr, (float)wh.pz };
-        Vector3 a   = { hub.x, hub.y, hub.z - ww };
-        Vector3 b   = { hub.x, hub.y, hub.z + ww };
-        bool sp  = wh.driven && spin;
-        Color tc = sp ? Color{200,60,55,255}
-                       : (wh.driven? Color{40,44,54,255} : Color{28,30,36,255});
-        DrawCylinderEx(a, b, wr, wr, 16, tc);
-        DrawCylinderWiresEx(a, b, wr, wr, 16,
-            i==monWheel? Color{150,200,240,255} : Color{110,114,124,255});
-
-        float ang=(float)wh.angle;
-        Vector3 tip = { hub.x + std::cos(ang)*wr*0.9f,
-                        hub.y + std::sin(ang)*wr*0.9f, hub.z };
-        DrawLine3D({hub.x,hub.y,hub.z-ww*1.05f},{tip.x,tip.y,hub.z-ww*1.05f},
-                   Color{210,214,224,255});
-        DrawLine3D({hub.x,hub.y,hub.z+ww*1.05f},{tip.x,tip.y,hub.z+ww*1.05f},
-                   Color{210,214,224,255});
+    // wheels: positions come from the raycast suspension
+    const auto& wo = world.wheels();
+    for(size_t i=0;i<wo.size();++i){
+        Vector3 c={wo[i].x,wo[i].y,wo[i].z};
+        float wr=(i<car.wheels.size())?(float)car.wheels[i].r:0.42f;
+        float hw=0.16f;
+        Vector3 a=Vector3Subtract(c,Vector3Scale(right,hw));
+        Vector3 b=Vector3Add(c,Vector3Scale(right,hw));
+        bool drv=(i<car.wheels.size())&&car.wheels[i].driven;
+        bool sp = drv && spin;
+        Color tc= sp?Color{200,60,55,255}:(drv?Color{40,44,54,255}:Color{28,30,36,255});
+        DrawCylinderEx(a,b,wr,wr,14,tc);
+        DrawCylinderWiresEx(a,b,wr,wr,14,
+            (int)i==monWheel?Color{150,200,240,255}:Color{110,114,124,255});
+        if(!wo[i].grounded)   // mark airborne wheels
+            DrawSphere(c,0.05f,Color{240,160,90,255});
+        // spin spoke lies in the wheel plane (spanned by fwd & up)
+        float aa=(i<car.wheels.size())?(float)car.wheels[i].angle:0.0f;
+        Vector3 spoke=Vector3Add(Vector3Scale(fwd,std::cos(aa)*wr*0.9f),
+                                 Vector3Scale(up,std::sin(aa)*wr*0.9f));
+        DrawLine3D(c,Vector3Add(c,spoke),Color{210,214,224,255});
     }
 
     EndMode3D();
@@ -156,14 +198,15 @@ static int cycler(float x,float y,const char* label,int val,int lo,int hi){
 }
 
 static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
-                       int& wheelSel, int& diffSel, int& pointSel, int& gearSel){
+                       int& wheelSel, int& diffSel, int& pointSel, int& gearSel,
+                       phys::Susp& susp, int& suspPreset){
     DrawRectangleRec(panel,Color{26,28,34,255});
     DrawRectangleLinesEx(panel,1,Color{60,64,74,255});
     DrawText("DRIVETRAIN EDITOR  (sim stopped)",(int)panel.x+12,(int)panel.y+8,16,
              Color{120,220,140,255});
 
-    GuiToggleGroup({panel.x+12,panel.y+30,96,26},
-                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH",&tab);
+    GuiToggleGroup({panel.x+12,panel.y+30,84,26},
+                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH;SUSP",&tab);
 
     float cx=panel.x+16, cy=panel.y+70;
 
@@ -302,7 +345,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         }
     }
     // ----------------------------- CLUTCH ----------------------------------
-    else {
+    else if(tab==4){
         Clutch& c=car.clu;
         DrawText("Clutch plates (count)",(int)cx,(int)cy+4,16,Color{150,160,175,255});
         if(GuiButton({cx+220,cy,30,26},"-") && c.plates>1) c.plates--;
@@ -316,6 +359,30 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
                  (int)cx,(int)cy+108,15,Color{120,200,240,255});
         DrawText("More plates -> more torque before the clutch slips.",
                  (int)cx,(int)cy+132,13,Color{120,128,140,255});
+    }
+    // ----------------------------- SUSPENSION ------------------------------
+    else {
+        DrawText("Preset",(int)cx,(int)cy+4,16,Color{150,160,175,255});
+        int old=suspPreset;
+        GuiToggleGroup({cx+70,cy,90,26},"SPORT;COMFORT;OFFROAD",&suspPreset);
+        if(suspPreset!=old) susp=phys::suspPreset(suspPreset);  // apply preset
+
+        auto fslider=[&](Rectangle r,const char*l,float&v,float lo,float hi,
+                         const char*fmt){
+            GuiSlider(r,l,TextFormat(fmt,v),&v,lo,hi); };
+        fslider({cx+110,cy+40,200,18},"Rest len",  susp.rest,     0.20f,0.70f,"%.2f m");
+        fslider({cx+110,cy+62,200,18},"Travel",    susp.travel,   0.08f,0.45f,"%.2f m");
+        fslider({cx+110,cy+84,200,18},"Stiffness", susp.stiffness,8000.f,60000.f,"%.0f");
+        fslider({cx+110,cy+106,200,18},"Damping",  susp.damping,  1000.f,9000.f,"%.0f");
+        fslider({cx+110,cy+128,200,18},"Wheel R",  susp.radius,   0.25f,0.55f,"%.2f m");
+
+        int lx=(int)panel.x+440, ly=(int)panel.y+64;
+        DrawText("Raycast suspension (spring + damper)",lx,ly,13,Color{120,128,140,255});
+        DrawText(TextFormat("preset: %s",phys::suspPresetName(suspPreset)),
+                 lx,ly+22,15,Color{120,220,140,255});
+        DrawText("Each wheel casts a ray down; the spring",lx,ly+50,13,Color{120,128,140,255});
+        DrawText("force holds the chassis off the terrain.",lx,ly+66,13,Color{120,128,140,255});
+        DrawText("Changes apply when you press PLAY.",lx,ly+92,13,Color{200,180,120,255});
     }
 }
 
@@ -336,12 +403,46 @@ int main(){
     if(haveSnd){ engSnd.looping=true; PlayMusicStream(engSnd); }
 
     Vehicle car;
-    float throttle=0, clutchEng=1.0f, brake=0;
-    bool  running=true;                       // play/stop state
-    bool  soundOn=false;                        // engine audio on/off
+    car.external = true;                       // Jolt owns the chassis motion
+    float throttle=0, clutchEng=1.0f, brake=0, steer=0;
+    bool  running=true;                        // play/stop state
+    bool  prevRunning=true;
+    bool  soundOn=false;                       // engine audio on/off
     int   editTab=0, wheelSel=0, diffSel=0, pointSel=0, gearSel=1;
     Plot  pRPM,pWheel,pSlip,pForce;
-    double groundScroll=0;
+
+    // --- 3D physics world: heightmap terrain + raycast-suspension vehicle ---
+    const int   TN=64;            // heightfield resolution
+    const float TCELL=2.0f;       // metres between samples
+    std::vector<float> heights((size_t)TN*TN);
+    for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++)
+        heights[(size_t)iz*TN+ix]=terrainH(ix,iz,TN);
+    float spawnH = heights[(size_t)(TN/2)*TN + (TN/2)] + 1.6f;
+
+    phys::World world;
+    world.setHeightfield(TN,TCELL,heights);
+    Model terrain = BuildTerrainModel(TN,TCELL,heights);
+
+    int        suspPreset = phys::SUSP_SPORT;
+    phys::Susp susp = phys::suspPreset(suspPreset);
+
+    // (re)build the rigid-body car from the current wheel configuration
+    auto buildVeh=[&](){
+        if(car.wheels.empty()) return;
+        std::vector<float> ox,oy,oz;
+        for(const Wheel& wh: car.wheels){
+            ox.push_back((float)wh.px); oy.push_back(0.0f); oz.push_back((float)wh.pz); }
+        float minx=1e9f,maxx=-1e9f,minz=1e9f,maxz=-1e9f;
+        for(const Wheel& wh: car.wheels){
+            minx=std::min(minx,(float)wh.px); maxx=std::max(maxx,(float)wh.px);
+            minz=std::min(minz,(float)wh.pz); maxz=std::max(maxz,(float)wh.pz); }
+        float blen=std::max((maxx-minx)+0.6f,1.2f);
+        float bwid=std::max((maxz-minz)+0.2f,0.8f);
+        world.setSusp(susp);
+        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f);
+        car.reset();
+    };
+    buildVeh();
 
     while(!WindowShouldClose()){
         // ---- input (keyboard adds to the sliders) -------------------------
@@ -351,6 +452,10 @@ int main(){
         else                                      brake=std::max(0.0f,brake-0.08f);
         if(IsKeyDown(KEY_SPACE))                  clutchEng=std::max(0.0f,clutchEng-0.08f);
         else                                      clutchEng=std::min(1.0f,clutchEng+0.05f);
+        float steerTgt=0.0f;                       // A/D (or arrows) steer
+        if(IsKeyDown(KEY_A)||IsKeyDown(KEY_LEFT))  steerTgt=-0.50f;
+        if(IsKeyDown(KEY_D)||IsKeyDown(KEY_RIGHT)) steerTgt=+0.50f;
+        steer += (steerTgt-steer)*0.20f;
         if(IsKeyPressed(KEY_E)&&car.box.gear<car.box.gears()) car.box.gear++;
         if(IsKeyPressed(KEY_Q)&&car.box.gear>0) car.box.gear--;
         if(IsKeyPressed(KEY_ONE))   car.surf=0;
@@ -358,15 +463,39 @@ int main(){
         if(IsKeyPressed(KEY_THREE)) car.surf=2;
         if(IsKeyPressed(KEY_P))     running=!running;          // toggle play/stop
         if(IsKeyPressed(KEY_M))     soundOn=!soundOn;          // mute/unmute sound
-        if(IsKeyPressed(KEY_R))     { car.reset(); throttle=brake=0; clutchEng=1; }
+        if(IsKeyPressed(KEY_R)) { car.reset(); world.resetVehicle(0,spawnH,0);
+                                  throttle=brake=0; clutchEng=1; }
 
         car.clu.engagement = clutchEng;
+        world.setSusp(susp);
 
-        // ---- physics: substep the driveline (only while running) ----------
-        if(running){
+        // rebuild the rigid-body car when (re)starting after edits
+        if(running && !prevRunning) buildVeh();
+        prevRunning = running;
+
+        // ---- physics: drivetrain + 3D rigid body (only while running) -----
+        if(running && world.hasVehicle()){
+            // feed the body state back into the drivetrain
+            car.v = world.forwardSpeed();
+            const auto& wo=world.wheels();
+            for(size_t i=0;i<car.wheels.size() && i<wo.size();++i)
+                car.wheels[i].Fz = wo[i].grounded ? wo[i].Fz : 0.0;
+
+            // advance the drivetrain (engine/clutch/gearbox/wheel spin -> Fx)
             const int SUB=8; double dt=(1.0/60.0)/SUB;
             for(int s=0;s<SUB;s++) car.step(dt,throttle,brake);
-            groundScroll += car.v*GetFrameTime()*1.2;
+
+            // hand each wheel's longitudinal tire force to Jolt and step it
+            std::vector<float> driveN(car.wheels.size());
+            for(size_t i=0;i<car.wheels.size();++i) driveN[i]=(float)car.wheels[i].Fx;
+            world.step(1.0f/60.0f, driveN, brake, steer, SURFACES[car.surf].mu);
+
+            // fell off the terrain? respawn at the centre pad
+            float bp[3]; world.bodyPosition(bp);
+            float half = (TN-1)*TCELL*0.5f;
+            if(bp[1] < -10.0f || std::fabs(bp[0])>half+4.0f || std::fabs(bp[2])>half+4.0f){
+                world.resetVehicle(0,spawnH,0); car.reset();
+            }
         }
 
         // ---- telemetry (pick a representative driven wheel to monitor) ----
@@ -439,7 +568,7 @@ int main(){
 
         if(GuiButton({200,262,80,26}, soundOn?"#122#Sound":"#123#Muted")) soundOn=!soundOn;
 
-        DrawText("KEYS: W throttle  S brake",20,294,14,Color{120,128,140,255});
+        DrawText("KEYS: W throttle  S brake  A/D steer",20,294,14,Color{120,128,140,255});
         DrawText("SPACE clutch  Q/E shift",20,314,14,Color{120,128,140,255});
         DrawText("1/2/3 surface  P play  M mute  R reset",20,334,14,Color{120,128,140,255});
 
@@ -469,10 +598,10 @@ int main(){
         DrawGauge({470+260,150},110,std::fabs(kmh),220,"km/h",
                   TextFormat("%.0f",std::fabs(kmh)),1.0);
 
-        // --- 3D car scene --------------------------------------------------
+        // --- 3D scene: heightmap + rigid-body car --------------------------
         Rectangle scene={330,278,820,170};
-        DrawCar3D(scene, car, groundScroll, mon, spin);
-        DrawText(TextFormat("gear %s   %s   %d wheels", gname,
+        DrawScene3D(scene, world, car, terrain, mon, spin);
+        DrawText(TextFormat("gear %s   %s   %d wheels   A/D steer", gname,
                  SURFACES[car.surf].name,(int)car.wheels.size()),
                  (int)scene.x+10,(int)scene.y+8,16,Color{180,188,200,255});
 
@@ -501,11 +630,13 @@ int main(){
             DrawPlot({lower.x,py+ph+14,pw*2+20,ph},pForce,-6000,6000,
                      Color{150,220,150,255},"monitored longitudinal force Fx [N]",0.0f);
         } else {
-            DrawEditor(lower, car, editTab, wheelSel, diffSel, pointSel, gearSel);
+            DrawEditor(lower, car, editTab, wheelSel, diffSel, pointSel, gearSel,
+                       susp, suspPreset);
         }
 
         EndDrawing();
     }
+    UnloadModel(terrain);
     if(haveSnd) UnloadMusicStream(engSnd);
     CloseAudioDevice();
     CloseWindow();

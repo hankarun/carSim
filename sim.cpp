@@ -140,16 +140,19 @@ void Vehicle::step(double dt,double throttle,double brake){
     if(N==0){ v=0; return; }
 
     // --- weight: distribute static load, then transfer front<->rear on accel
-    double Wt        = mass*g;
-    double staticEach= Wt/N;
-    double dFz       = mass*accel*cgH/wheelbase;   // total transferred front->rear
-    int nf=0,nr=0;
-    for(const Wheel& wh: wheels){ if(wh.px>0) nf++; else nr++; }
-    for(Wheel& wh: wheels){
-        double t = 0.0;
-        if(wh.px>0 && nf>0) t = -dFz/nf;           // front sheds load
-        else if(wh.px<=0 && nr>0) t = +dFz/nr;     // rear gains load
-        wh.Fz = clampd(staticEach + t, 0.0, 1e6);
+    // (skipped in external mode -- the 3D suspension supplies each wheel's Fz)
+    double Wt = mass*g;
+    if(!external){
+        double staticEach= Wt/N;
+        double dFz       = mass*accel*cgH/wheelbase;   // transferred front->rear
+        int nf=0,nr=0;
+        for(const Wheel& wh: wheels){ if(wh.px>0) nf++; else nr++; }
+        for(Wheel& wh: wheels){
+            double t = 0.0;
+            if(wh.px>0 && nf>0) t = -dFz/nf;           // front sheds load
+            else if(wh.px<=0 && nr>0) t = +dFz/nr;     // rear gains load
+            wh.Fz = clampd(staticEach + t, 0.0, 1e6);
+        }
     }
 
     // --- engine vs driveline coupling through the clutch --------------------
@@ -230,11 +233,15 @@ void Vehicle::step(double dt,double throttle,double brake){
     }
 
     // --- chassis longitudinal dynamics --------------------------------------
-    double drag = 0.5*rho*Cd*A*v*std::fabs(v);
-    double roll = Crr*Wt*sgn(v);
-    double net  = Fx_total - drag - roll;
-    accel = net/mass;
-    v    += dt*accel;
-    if(std::fabs(v)<1e-3 && std::fabs(net)<roll+1.0) v=0.0; // settle at rest
-    x    += dt*v;
+    // In external mode the 3D rigid body integrates motion (and feeds v back in
+    // before the next call), so we only run this simple 1D model standalone.
+    if(!external){
+        double drag = 0.5*rho*Cd*A*v*std::fabs(v);
+        double roll = Crr*Wt*sgn(v);
+        double net  = Fx_total - drag - roll;
+        accel = net/mass;
+        v    += dt*accel;
+        if(std::fabs(v)<1e-3 && std::fabs(net)<roll+1.0) v=0.0; // settle at rest
+        x    += dt*v;
+    }
 }
