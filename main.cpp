@@ -98,6 +98,38 @@ static Color zoneColor(int z){
                default:return Color{ 46, 56, 50,255}; }// DRY  (muted green)
 }
 
+// --- single directional-light shader (loaded from memory, no asset files) ---
+static const char* TERRAIN_VS =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec3 vertexNormal;\n"
+    "in vec4 vertexColor;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matNormal;\n"
+    "out vec3 fragNormal;\n"
+    "out vec4 fragColor;\n"
+    "void main(){\n"
+    "    fragColor  = vertexColor;\n"
+    "    fragNormal = normalize(vec3(matNormal*vec4(vertexNormal,0.0)));\n"
+    "    gl_Position = mvp*vec4(vertexPosition,1.0);\n"
+    "}\n";
+static const char* TERRAIN_FS =
+    "#version 330\n"
+    "in vec3 fragNormal;\n"
+    "in vec4 fragColor;\n"
+    "uniform vec3 lightDir;\n"
+    "uniform vec3 lightColor;\n"
+    "uniform float ambient;\n"
+    "uniform vec4 colDiffuse;\n"
+    "out vec4 finalColor;\n"
+    "void main(){\n"
+    "    vec3 N = normalize(fragNormal);\n"
+    "    float d = max(dot(N, -normalize(lightDir)), 0.0);\n"
+    "    vec3 base = fragColor.rgb*colDiffuse.rgb;\n"
+    "    vec3 lit  = base*(ambient + d*lightColor);\n"
+    "    finalColor = vec4(lit, fragColor.a*colDiffuse.a);\n"
+    "}\n";
+
 // build a raylib mesh from the same height samples Jolt uses (exact match),
 // colouring each vertex by its grip zone
 static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
@@ -109,13 +141,19 @@ static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
     m.colors   = (unsigned char*)MemAlloc(m.vertexCount*4*sizeof(unsigned char));
     m.indices  = (unsigned short*)MemAlloc(m.triangleCount*3*sizeof(unsigned short));
     float span=(N-1)*cell;
+    auto H=[&](int ix,int iz){ ix=ix<0?0:(ix>=N?N-1:ix); iz=iz<0?0:(iz>=N?N-1:iz);
+                               return h[(size_t)iz*N+ix]; };
     for(int iz=0;iz<N;iz++) for(int ix=0;ix<N;ix++){
         int v=iz*N+ix;
         float wx=-span*0.5f+cell*ix, wz=-span*0.5f+cell*iz;
         m.vertices[v*3+0]=wx;
         m.vertices[v*3+1]=h[(size_t)iz*N+ix];
         m.vertices[v*3+2]=wz;
-        m.normals[v*3+0]=0; m.normals[v*3+1]=1; m.normals[v*3+2]=0;
+        // normal from the height gradient (central differences)
+        float dx=H(ix+1,iz)-H(ix-1,iz);
+        float dz=H(ix,iz+1)-H(ix,iz-1);
+        Vector3 nrm=Vector3Normalize({-dx, 2.0f*cell, -dz});
+        m.normals[v*3+0]=nrm.x; m.normals[v*3+1]=nrm.y; m.normals[v*3+2]=nrm.z;
         Color zc=zoneColor(surfZone(wx,wz));
         m.colors[v*4+0]=zc.r; m.colors[v*4+1]=zc.g; m.colors[v*4+2]=zc.b; m.colors[v*4+3]=255;
     }
@@ -446,6 +484,18 @@ int main(){
     phys::World world;
     world.setHeightfield(TN,TCELL,heights);
     Model terrain = BuildTerrainModel(TN,TCELL,heights);
+
+    // directional light shader for the terrain
+    Shader litShader = LoadShaderFromMemory(TERRAIN_VS,TERRAIN_FS);
+    {
+        Vector3 ld = Vector3Normalize({-0.55f,-1.0f,-0.35f}); // sun direction
+        Vector3 lc = {1.0f,0.96f,0.88f};                      // warm light
+        float   amb= 0.38f;                                   // ambient floor
+        SetShaderValue(litShader,GetShaderLocation(litShader,"lightDir"),  &ld,SHADER_UNIFORM_VEC3);
+        SetShaderValue(litShader,GetShaderLocation(litShader,"lightColor"),&lc,SHADER_UNIFORM_VEC3);
+        SetShaderValue(litShader,GetShaderLocation(litShader,"ambient"),   &amb,SHADER_UNIFORM_FLOAT);
+    }
+    terrain.materials[0].shader = litShader;
 
     int        suspPreset = phys::SUSP_SPORT;
     phys::Susp susp = phys::suspPreset(suspPreset);
