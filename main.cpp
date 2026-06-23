@@ -70,33 +70,54 @@ static void DrawPlot(Rectangle r,const Plot& p,float lo,float hi,Color col,
 }
 
 // ----------------------------- terrain --------------------------------------
-// simple analytic heightmap (rolling hills, flattened near the spawn origin)
-static float terrainH(int ix,int iz,int N){
-    float wx=((float)ix/(N-1))*2.0f-1.0f;
-    float wz=((float)iz/(N-1))*2.0f-1.0f;
-    float h = std::sin(wx*4.0f)*std::cos(wz*3.0f)*2.2f      // big rolling hills
-            + std::sin((wx+wz)*2.3f)*1.1f
-            + std::sin(wx*9.0f)*std::cos(wz*8.0f)*0.7f       // medium bumps
-            + std::cos(wx*15.0f+wz*12.0f)*0.35f;             // fine chatter
+// analytic heightmap in WORLD metres so the bump density stays constant no
+// matter how big the map is; flattened near the spawn origin.
+static float terrainH(float wx,float wz){
+    float h = std::sin(wx*0.18f)*std::cos(wz*0.15f)*2.4f     // big rolling hills
+            + std::sin((wx+wz)*0.11f)*1.2f
+            + std::sin(wx*0.45f)*std::cos(wz*0.40f)*0.8f       // medium bumps
+            + std::cos(wx*0.75f+wz*0.62f)*0.35f;               // fine chatter
     float d = std::sqrt(wx*wx+wz*wz);
-    float flat = (float)clampd(1.0-d*3.5,0.0,1.0);   // flat pad at the centre
+    float flat = (float)clampd(1.0-d/16.0,0.0,1.0);    // ~16 m flat spawn pad
     return h*(1.0f-flat);
 }
-// build a raylib mesh from the same height samples Jolt uses (exact match)
+
+// low-frequency noise carves the map into grip zones: 0=DRY 1=WET 2=ICE
+static int surfZone(float wx,float wz){
+    if(wx*wx+wz*wz < 16.0f*16.0f) return 0;            // dry spawn area
+    float v = std::sin(wx*0.045f+1.7f)*std::cos(wz*0.039f-0.6f)
+            + 0.6f*std::sin(wx*0.021f-wz*0.027f+3.1f)
+            + 0.4f*std::cos(wx*0.063f+wz*0.017f);
+    if(v >  0.85f) return 1;                           // wet patch
+    if(v < -0.85f) return 2;                           // icy patch
+    return 0;                                          // dry
+}
+static Color zoneColor(int z){
+    switch(z){ case 1: return Color{ 32, 74,124,255};  // WET  (deep blue)
+               case 2: return Color{170,198,224,255};  // ICE  (pale blue)
+               default:return Color{ 46, 56, 50,255}; }// DRY  (muted green)
+}
+
+// build a raylib mesh from the same height samples Jolt uses (exact match),
+// colouring each vertex by its grip zone
 static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
     Mesh m{};
     m.vertexCount   = N*N;
     m.triangleCount = (N-1)*(N-1)*2;
     m.vertices = (float*)MemAlloc(m.vertexCount*3*sizeof(float));
     m.normals  = (float*)MemAlloc(m.vertexCount*3*sizeof(float));
+    m.colors   = (unsigned char*)MemAlloc(m.vertexCount*4*sizeof(unsigned char));
     m.indices  = (unsigned short*)MemAlloc(m.triangleCount*3*sizeof(unsigned short));
     float span=(N-1)*cell;
     for(int iz=0;iz<N;iz++) for(int ix=0;ix<N;ix++){
         int v=iz*N+ix;
-        m.vertices[v*3+0]=-span*0.5f+cell*ix;
+        float wx=-span*0.5f+cell*ix, wz=-span*0.5f+cell*iz;
+        m.vertices[v*3+0]=wx;
         m.vertices[v*3+1]=h[(size_t)iz*N+ix];
-        m.vertices[v*3+2]=-span*0.5f+cell*iz;
+        m.vertices[v*3+2]=wz;
         m.normals[v*3+0]=0; m.normals[v*3+1]=1; m.normals[v*3+2]=0;
+        Color zc=zoneColor(surfZone(wx,wz));
+        m.colors[v*4+0]=zc.r; m.colors[v*4+1]=zc.g; m.colors[v*4+2]=zc.b; m.colors[v*4+3]=255;
     }
     int t=0;
     for(int iz=0;iz<N-1;iz++) for(int ix=0;ix<N-1;ix++){
@@ -137,9 +158,9 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     ClearBackground(Color{20,24,34,255});
     BeginMode3D(cam);
 
-    // terrain: dark fill + wireframe to match the car's look
-    DrawModel(terrain,{0,0,0},1.0f,Color{28,36,50,255});
-    DrawModelWires(terrain,{0,0,0},1.0f,Color{54,70,92,255});
+    // terrain: zone-coloured fill (vertex colours) + faint wire grid overlay
+    DrawModel(terrain,{0,0,0},1.0f,WHITE);
+    DrawModelWires(terrain,{0,0,0},1.0f,Color{255,255,255,40});
 
     // chassis: wireframe box following the body's full orientation
     float dims[3]; world.bodyDims(dims);
@@ -412,11 +433,14 @@ int main(){
     Plot  pRPM,pWheel,pSlip,pForce;
 
     // --- 3D physics world: heightmap terrain + raycast-suspension vehicle ---
-    const int   TN=64;            // heightfield resolution
-    const float TCELL=2.0f;       // metres between samples
+    const int   TN=128;           // heightfield resolution (bigger map)
+    const float TCELL=2.2f;       // metres between samples -> ~280 m square
+    const float TSPAN=(TN-1)*TCELL;
     std::vector<float> heights((size_t)TN*TN);
-    for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++)
-        heights[(size_t)iz*TN+ix]=terrainH(ix,iz,TN);
+    for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++){
+        float wx=-TSPAN*0.5f+TCELL*ix, wz=-TSPAN*0.5f+TCELL*iz;
+        heights[(size_t)iz*TN+ix]=terrainH(wx,wz);
+    }
     float spawnH = heights[(size_t)(TN/2)*TN + (TN/2)] + 1.6f;
 
     phys::World world;
@@ -475,6 +499,10 @@ int main(){
 
         // ---- physics: drivetrain + 3D rigid body (only while running) -----
         if(running && world.hasVehicle()){
+            // grip follows the terrain zone the car is currently sitting on
+            float bp0[3]; world.bodyPosition(bp0);
+            car.surf = surfZone(bp0[0], bp0[2]);
+
             // feed the body state back into the drivetrain
             car.v = world.forwardSpeed();
             const auto& wo=world.wheels();
@@ -492,7 +520,7 @@ int main(){
 
             // fell off the terrain? respawn at the centre pad
             float bp[3]; world.bodyPosition(bp);
-            float half = (TN-1)*TCELL*0.5f;
+            float half = TSPAN*0.5f;
             if(bp[1] < -10.0f || std::fabs(bp[0])>half+4.0f || std::fabs(bp[2])>half+4.0f){
                 world.resetVehicle(0,spawnH,0); car.reset();
             }
