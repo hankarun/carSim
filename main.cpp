@@ -38,13 +38,16 @@ static void DrawGauge(Vector2 c,float R,double val,double maxv,
     }
     double f = clampd(val/maxv,0,1);
     double a=(135 - f*270.0)*DEG2RAD;
-    DrawLineEx(c,{(float)(c.x+std::cos(a)*(R-16)),(float)(c.y-std::sin(a)*(R-16))},
-               4,Color{240,200,90,255});
-    DrawCircle((int)c.x,(int)c.y,5,Color{240,200,90,255});
-    int lw=MeasureText(label,16);
-    DrawText(label,(int)c.x-lw/2,(int)c.y+R-30,16,Color{150,160,175,255});
-    int rw=MeasureText(readout,22);
-    DrawText(readout,(int)c.x-rw/2,(int)c.y+18,22,RAYWHITE); // below needle pivot
+    DrawLineEx(c,{(float)(c.x+std::cos(a)*(R-R*0.15f)),(float)(c.y-std::sin(a)*(R-R*0.15f))},
+               std::max(2.0f,R*0.04f),Color{240,200,90,255});
+    DrawCircle((int)c.x,(int)c.y,std::max(3.0f,R*0.05f),Color{240,200,90,255});
+    // proportional text so the gauge reads at any size
+    int lf=std::max(9,(int)(R*0.20f));         // label font
+    int rf=std::max(13,(int)(R*0.32f));        // readout font
+    int lw=MeasureText(label,lf);
+    DrawText(label,(int)c.x-lw/2,(int)(c.y+R*0.50f),lf,Color{150,160,175,255});
+    int rw=MeasureText(readout,rf);
+    DrawText(readout,(int)c.x-rw/2,(int)(c.y+R*0.14f),rf,RAYWHITE);
 }
 
 struct Plot {
@@ -177,7 +180,11 @@ static Vector3 gCamPos = {6.0f,5.0f,8.0f};
 static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
                         Model terrain, int monWheel, bool spin){
     static RenderTexture2D rt{};
-    if(rt.id==0) rt = LoadRenderTexture((int)view.width,(int)view.height);
+    if(rt.id==0 || rt.texture.width!=(int)view.width
+                || rt.texture.height!=(int)view.height){
+        if(rt.id!=0) UnloadRenderTexture(rt);
+        rt = LoadRenderTexture((int)view.width,(int)view.height);
+    }
 
     float bp[3]; world.bodyPosition(bp);
     float bq[4]; world.bodyQuat(bq);
@@ -450,9 +457,10 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
 
 // ----------------------------- main -----------------------------------------
 int main(){
-    const int W=1180,H=720;
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    int W=1180,H=720;
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(W,H,"Drivetrain Simulator  -  configurable engine | clutch | diffs | wheels");
+    SetWindowMinSize(1080,680);
     SetTargetFPS(60);
     GuiSetStyle(DEFAULT,TEXT_SIZE,16);
 
@@ -633,11 +641,19 @@ int main(){
         }
 
         // ===================== render ======================================
+        W=GetScreenWidth(); H=GetScreenHeight();
+        // responsive layout: fixed left panel, big 3D view, lower plots/editor
+        const float PANELW=300.0f, M=10.0f;
+        Rectangle scene={PANELW+M, M, (float)W-(PANELW+2*M),
+                         (float)(H-3*M)*0.64f};
+        Rectangle lower={scene.x, scene.y+scene.height+M, scene.width,
+                         (float)H-(scene.y+scene.height+2*M)};
+
         BeginDrawing();
         ClearBackground(Color{18,20,25,255});
 
         // --- left: live controls (raygui) ----------------------------------
-        DrawRectangle(0,0,300,H,Color{26,28,34,255});
+        DrawRectangle(0,0,(int)PANELW,H,Color{26,28,34,255});
         DrawText("PARAMETERS",20,16,18,Color{150,160,175,255});
         GuiSlider({110,52,150,22},"Throttle",TextFormat("%.2f",throttle),&throttle,0,1);
         GuiSlider({110,82,150,22},"Clutch",  TextFormat("%.2f",clutchEng),&clutchEng,0,1);
@@ -691,30 +707,28 @@ int main(){
             DrawText("ENGINE STALLED\n-> clutch in / neutral to restart",20,ry+22,14,
                      Color{240,160,90,255});
 
-        // --- gauges --------------------------------------------------------
-        DrawGauge({470,150},110,rpm,7000,"RPM x1000",
-                  TextFormat("%.1f",rpm/1000.0), car.eng.redline/7000.0);
-        DrawGauge({470+260,150},110,std::fabs(kmh),220,"km/h",
-                  TextFormat("%.0f",std::fabs(kmh)),1.0);
-
-        // --- 3D scene: heightmap + rigid-body car --------------------------
-        Rectangle scene={330,278,820,170};
+        // --- 3D scene: heightmap + rigid-body car (big) --------------------
         DrawScene3D(scene, world, car, terrain, mon, spin);
         DrawText(TextFormat("gear %s   %s   %d wheels   A/D steer", gname,
                  SURFACES[car.surf].name,(int)car.wheels.size()),
                  (int)scene.x+10,(int)scene.y+8,16,Color{180,188,200,255});
 
         // terrain selector (regenerates the heightfield + respawns the car)
-        DrawText("TERRAIN",(int)scene.x+scene.width-208,(int)scene.y+10,13,
-                 Color{180,188,200,255});
         int tmode=terrainMode;
-        GuiToggleGroup({scene.x+scene.width-140,scene.y+6,66,22},"NOISE;FLAT",&tmode);
+        GuiToggleGroup({scene.x+scene.width-150,scene.y+8,68,22},"NOISE;FLAT",&tmode);
         if(tmode!=terrainMode){ terrainMode=tmode; regenTerrain(); }
 
+        // --- small gauges in the bottom corners of the 3D view -------------
+        float gR=std::min(70.0f, scene.width*0.075f);
+        DrawGauge({scene.x+gR+14, scene.y+scene.height-gR-14}, gR,
+                  rpm,7000,"RPM x1000",TextFormat("%.1f",rpm/1000.0),
+                  car.eng.redline/7000.0);
+        DrawGauge({scene.x+scene.width-gR-14, scene.y+scene.height-gR-14}, gR,
+                  std::fabs(kmh),220,"km/h",TextFormat("%.0f",std::fabs(kmh)),1.0);
+
         // --- lower area: plots while running, editor while stopped ---------
-        Rectangle lower={330,458,820,252};
         if(running){
-            float py=lower.y, pw=400, ph=116;
+            float pw=(lower.width-20)*0.5f, ph=(lower.height-14)*0.5f, py=lower.y;
             DrawPlot({lower.x,py,pw,ph},pRPM,0,7000,Color{240,200,90,255},"engine rpm");
             DrawPlot({lower.x,py,pw,ph},pWheel,0,7000,Color{120,200,240,255},
                      "wheel-equiv rpm",NAN);
@@ -733,7 +747,7 @@ int main(){
                 DrawText("green = +/-k_peak (past it = sliding)",
                          (int)r.x+6,(int)(r.y+r.height-18),12,Color{120,128,140,255});
             }
-            DrawPlot({lower.x,py+ph+14,pw*2+20,ph},pForce,-6000,6000,
+            DrawPlot({lower.x,py+ph+14,lower.width,ph},pForce,-6000,6000,
                      Color{150,220,150,255},"monitored longitudinal force Fx [N]",0.0f);
         } else {
             DrawEditor(lower, car, editTab, wheelSel, diffSel, pointSel, gearSel,
