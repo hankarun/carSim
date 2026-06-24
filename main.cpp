@@ -179,7 +179,7 @@ static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
 static Vector3 gCamPos = {6.0f,5.0f,8.0f};
 static float   gOrbitYaw=2.4f, gOrbitPitch=0.5f, gOrbitDist=12.0f;
 static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
-                        Model terrain, int monWheel, bool spin){
+                        Model terrain, int monWheel, bool spin, Vector3 com){
     static RenderTexture2D rt{};
     if(rt.id==0 || rt.texture.width!=(int)view.width
                 || rt.texture.height!=(int)view.height){
@@ -233,6 +233,10 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     if(Vector3Length(axis)>0.001f) rlRotatef(ang*RAD2DEG,axis.x,axis.y,axis.z);
     DrawCubeWires({0,0,0},dims[0],dims[1],dims[2],Color{120,150,200,255});
     rlPopMatrix();
+
+    // centre-of-mass marker (red sphere)
+    Vector3 comW=Vector3Add(pos,Vector3RotateByQuaternion({com.x,com.y,com.z},q));
+    DrawSphere(comW,0.13f,Color{235,80,70,255});
 
     // wheels: positions come from the raycast suspension
     const auto& wo = world.wheels();
@@ -326,14 +330,14 @@ static int cycler(float x,float y,const char* label,int val,int lo,int hi){
 
 static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
                        int& wheelSel, int& diffSel, int& pointSel, int& gearSel,
-                       phys::Susp& susp, int& suspPreset){
+                       phys::Susp& susp, int& suspPreset, Vector3& com){
     DrawRectangleRec(panel,Color{26,28,34,255});
     DrawRectangleLinesEx(panel,1,Color{60,64,74,255});
     DrawText("DRIVETRAIN EDITOR  (sim stopped)",(int)panel.x+12,(int)panel.y+8,16,
              Color{120,220,140,255});
 
-    GuiToggleGroup({panel.x+12,panel.y+30,84,26},
-                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH;SUSP",&tab);
+    GuiToggleGroup({panel.x+12,panel.y+30,76,26},
+                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH;BODY;SUSP",&tab);
 
     float cx=panel.x+16, cy=panel.y+70;
 
@@ -487,6 +491,25 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         DrawText("More plates -> more torque before the clutch slips.",
                  (int)cx,(int)cy+132,13,Color{120,128,140,255});
     }
+    // ----------------------------- BODY (mass + CoM) -----------------------
+    else if(tab==5){
+        dSlider({cx+130,cy+4,210,20},"Vehicle mass",car.mass,600.0f,3000.0f,"%.0f kg");
+
+        DrawText("Centre of mass offset (body space)",(int)cx,(int)cy+38,14,
+                 Color{150,160,175,255});
+        auto fsl=[&](Rectangle r,const char*l,float&v,float lo,float hi){
+            GuiSlider(r,l,TextFormat("%+.2f m",v),&v,lo,hi); };
+        fsl({cx+150,cy+62,190,18}, "Fwd/back X", com.x,-1.20f,1.20f);
+        fsl({cx+150,cy+86,190,18}, "Up/down Y",  com.y,-0.40f,0.50f);
+        fsl({cx+150,cy+110,190,18},"Left/right Z",com.z,-0.70f,0.70f);
+
+        int lx=(int)panel.x+440, ly=(int)panel.y+64;
+        DrawText(TextFormat("mass: %.0f kg",car.mass),lx,ly,15,Color{120,200,240,255});
+        DrawText("Red sphere in the 3D view = CoM.",lx,ly+26,13,Color{120,128,140,255});
+        DrawText("Forward CoM -> more front grip;",lx,ly+48,13,Color{120,128,140,255});
+        DrawText("lower CoM -> resists rollover.",lx,ly+64,13,Color{120,128,140,255});
+        DrawText("Changes apply when you press PLAY.",lx,ly+90,13,Color{200,180,120,255});
+    }
     // ----------------------------- SUSPENSION ------------------------------
     else {
         DrawText("Preset",(int)cx,(int)cy+4,16,Color{150,160,175,255});
@@ -568,6 +591,7 @@ int main(){
 
     int        suspPreset = phys::SUSP_SPORT;
     phys::Susp susp = phys::suspPreset(suspPreset);
+    Vector3    com  = {0,0,0};      // centre-of-mass offset (body space, m)
 
     // (re)build the rigid-body car from the current wheel configuration
     auto buildVeh=[&](){
@@ -582,7 +606,8 @@ int main(){
         float blen=std::max((maxx-minx)+0.6f,1.2f);
         float bwid=std::max((maxz-minz)+0.2f,0.8f);
         world.setSusp(susp);
-        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f);
+        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f,
+                           com.x,com.y,com.z);
         car.reset();
     };
 
@@ -780,7 +805,7 @@ int main(){
                      Color{240,160,90,255});
 
         // --- 3D scene: heightmap + rigid-body car (big) --------------------
-        DrawScene3D(scene, world, car, terrain, mon, spin);
+        DrawScene3D(scene, world, car, terrain, mon, spin, com);
         DrawText(TextFormat("gear %s   %s   %d wheels   A/D steer", gname,
                  SURFACES[car.surf].name,(int)car.wheels.size()),
                  (int)scene.x+10,(int)scene.y+8,16,Color{180,188,200,255});
@@ -825,7 +850,7 @@ int main(){
                      Color{150,220,150,255},"monitored longitudinal force Fx [N]",0.0f);
         } else {
             DrawEditor(lower, car, editTab, wheelSel, diffSel, pointSel, gearSel,
-                       susp, suspPreset);
+                       susp, suspPreset, com);
         }
 
         EndDrawing();

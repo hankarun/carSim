@@ -64,7 +64,8 @@ public:
                       const std::vector<float>& offY,
                       const std::vector<float>& offZ,
                       float bodyLen,float bodyHei,float bodyWid,float mass,
-                      float spawnX,float spawnY,float spawnZ);
+                      float spawnX,float spawnY,float spawnZ,
+                      float comX=0,float comY=0,float comZ=0); // COM offset (body space)
     bool hasVehicle() const;
     void setSusp(const Susp& s);
     void resetVehicle(float x,float y,float z);

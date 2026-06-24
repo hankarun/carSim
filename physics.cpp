@@ -19,6 +19,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -183,7 +184,8 @@ void World::buildVehicle(const std::vector<float>& offX,
                          const std::vector<float>& offY,
                          const std::vector<float>& offZ,
                          float bodyLen,float bodyHei,float bodyWid,float mass,
-                         float spawnX,float spawnY,float spawnZ){
+                         float spawnX,float spawnY,float spawnZ,
+                         float comX,float comY,float comZ){
     BodyInterface& bi = p_->sys.GetBodyInterface();
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis);
                          p_->haveChassis=false; }
@@ -192,8 +194,11 @@ void World::buildVehicle(const std::vector<float>& offX,
     p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
     wout_.assign(offX.size(), WheelOut{});
 
+    // box chassis, wrapped so its centre of mass can be shifted (body space)
     BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
-    ShapeSettings::ShapeResult res = boxS.Create();
+    ShapeRefC boxShape = boxS.Create().Get();
+    OffsetCenterOfMassShapeSettings comS(Vec3(comX,comY,comZ), boxShape);
+    ShapeSettings::ShapeResult res = comS.Create();
     BodyCreationSettings bcs(res.Get(),
         RVec3(spawnX,spawnY,spawnZ), Quat::sIdentity(),
         EMotionType::Dynamic, Layers::MOVING);
@@ -271,7 +276,7 @@ void World::step(float dt, const std::vector<float>& driveN,
                  float brake, float steerRad, float mu){
     if(p_->haveChassis){
         BodyInterface& bi = p_->sys.GetBodyInterface();
-        RVec3 bp = bi.GetCenterOfMassPosition(p_->chassis);
+        RVec3 bp = bi.GetPosition(p_->chassis);     // shape origin (box centre)
         Quat  bq = bi.GetRotation(p_->chassis);
         Vec3  up    = bq*Vec3(0,1,0);
         Vec3  fwd   = bq*Vec3(1,0,0);
@@ -362,7 +367,7 @@ void World::step(float dt, const std::vector<float>& driveN,
 // ----------------------------- read-back ------------------------------------
 void World::bodyPosition(float o[3]) const {
     if(!p_->haveChassis){ o[0]=o[1]=o[2]=0; return; }
-    RVec3 p = p_->sys.GetBodyInterface().GetCenterOfMassPosition(p_->chassis);
+    RVec3 p = p_->sys.GetBodyInterface().GetPosition(p_->chassis);  // shape origin
     o[0]=p.GetX(); o[1]=p.GetY(); o[2]=p.GetZ();
 }
 void World::bodyQuat(float o[4]) const {
