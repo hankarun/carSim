@@ -18,6 +18,7 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -112,6 +113,9 @@ struct World::Impl {
     BodyID chassis;
     bool   haveChassis = false;
 
+    std::vector<BodyID>      obsId;     // obstacle bodies
+    std::vector<ObstacleOut> obsInit;   // spawn transforms (for reset)
+
     // terrain
     int   hmN    = 0;
     float hmCell = 2.0f;
@@ -137,6 +141,7 @@ World::World() {
 
 World::~World() {
     BodyInterface& bi = p_->sys.GetBodyInterface();
+    for(BodyID id : p_->obsId){ bi.RemoveBody(id); bi.DestroyBody(id); }
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis); }
     if(!p_->ground.IsInvalid()){ bi.RemoveBody(p_->ground); bi.DestroyBody(p_->ground); }
     delete p_->jobs;
@@ -211,6 +216,55 @@ void World::resetVehicle(float x,float y,float z){
                               EActivation::Activate);
     bi.SetLinearVelocity (p_->chassis, Vec3::sZero());
     bi.SetAngularVelocity(p_->chassis, Vec3::sZero());
+}
+
+// ----------------------------- obstacles ------------------------------------
+void World::addCrate(float x,float y,float z,float half,float mass){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    BoxShapeSettings bs(Vec3(half,half,half));
+    BodyCreationSettings bcs(bs.Create().Get(), RVec3(x,y,z), Quat::sIdentity(),
+                             EMotionType::Dynamic, Layers::MOVING);
+    bcs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+    bcs.mMassPropertiesOverride.mMass = mass;
+    Body* b = bi.CreateBody(bcs);
+    bi.AddBody(b->GetID(), EActivation::Activate);
+    p_->obsId.push_back(b->GetID());
+    ObstacleOut o; o.kind=0; o.px=x;o.py=y;o.pz=z; o.qw=1;
+    o.sx=o.sy=o.sz=half; o.dynamic=1;
+    obs_.push_back(o); p_->obsInit.push_back(o);
+}
+
+void World::addRamp(float x,float y,float z,float yawRad,
+                    float L,float h,float w){
+    float hL=L*0.5f, hw=w*0.5f;
+    Array<Vec3> pts;                         // centred triangular prism
+    pts.push_back(Vec3(-hL,0,-hw)); pts.push_back(Vec3(-hL,0, hw));
+    pts.push_back(Vec3( hL,0,-hw)); pts.push_back(Vec3( hL,0, hw));
+    pts.push_back(Vec3( hL,h,-hw)); pts.push_back(Vec3( hL,h, hw));
+    ConvexHullShapeSettings hs(pts, 0.0f);
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    Quat q = Quat::sRotation(Vec3(0,1,0), yawRad);
+    Body* b = bi.CreateBody(BodyCreationSettings(hs.Create().Get(),
+                RVec3(x,y,z), q, EMotionType::Static, Layers::NON_MOVING));
+    bi.AddBody(b->GetID(), EActivation::DontActivate);
+    p_->obsId.push_back(b->GetID());
+    ObstacleOut o; o.kind=1; o.px=x;o.py=y;o.pz=z;
+    o.qx=q.GetX();o.qy=q.GetY();o.qz=q.GetZ();o.qw=q.GetW();
+    o.sx=L;o.sy=h;o.sz=w; o.dynamic=0;
+    obs_.push_back(o); p_->obsInit.push_back(o);
+}
+
+void World::resetObstacles(){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        const ObstacleOut& s=p_->obsInit[i];
+        bi.SetPositionAndRotation(p_->obsId[i], RVec3(s.px,s.py,s.pz),
+            Quat(s.qx,s.qy,s.qz,s.qw), EActivation::Activate);
+        bi.SetLinearVelocity (p_->obsId[i], Vec3::sZero());
+        bi.SetAngularVelocity(p_->obsId[i], Vec3::sZero());
+        obs_[i]=s;
+    }
 }
 
 void World::step(float dt, const std::vector<float>& driveN,
@@ -293,6 +347,16 @@ void World::step(float dt, const std::vector<float>& driveN,
     }
 
     p_->sys.Update(dt, 2, p_->temp, p_->jobs);
+
+    // refresh dynamic obstacle (crate) transforms for rendering
+    BodyInterface& bi2 = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        RVec3 p = bi2.GetPosition(p_->obsId[i]);
+        Quat  q = bi2.GetRotation(p_->obsId[i]);
+        obs_[i].px=p.GetX(); obs_[i].py=p.GetY(); obs_[i].pz=p.GetZ();
+        obs_[i].qx=q.GetX(); obs_[i].qy=q.GetY(); obs_[i].qz=q.GetZ(); obs_[i].qw=q.GetW();
+    }
 }
 
 // ----------------------------- read-back ------------------------------------
