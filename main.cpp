@@ -70,9 +70,12 @@ static void DrawPlot(Rectangle r,const Plot& p,float lo,float hi,Color col,
 }
 
 // ----------------------------- terrain --------------------------------------
+static bool gFlatTerrain = false;   // selectable: noise hills vs flat plane
+
 // analytic heightmap in WORLD metres so the bump density stays constant no
 // matter how big the map is; flattened near the spawn origin.
 static float terrainH(float wx,float wz){
+    if(gFlatTerrain) return 0.0f;
     float h = std::sin(wx*0.18f)*std::cos(wz*0.15f)*2.4f     // big rolling hills
             + std::sin((wx+wz)*0.11f)*1.2f
             + std::sin(wx*0.45f)*std::cos(wz*0.40f)*0.8f       // medium bumps
@@ -516,6 +519,24 @@ int main(){
         world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f);
         car.reset();
     };
+
+    // regenerate the heightfield + terrain mesh for the chosen mode (noise/flat)
+    int terrainMode=0;             // 0 = noise hills, 1 = flat
+    auto regenTerrain=[&](){
+        gFlatTerrain = (terrainMode==1);
+        for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++){
+            float wx=-TSPAN*0.5f+TCELL*ix, wz=-TSPAN*0.5f+TCELL*iz;
+            heights[(size_t)iz*TN+ix]=terrainH(wx,wz);
+        }
+        world.setHeightfield(TN,TCELL,heights);
+        spawnH = heights[(size_t)(TN/2)*TN + (TN/2)] + 1.6f;
+        terrain.materials[0].shader.id = rlGetShaderIdDefault(); // detach (keep litShader)
+        UnloadModel(terrain);
+        terrain = BuildTerrainModel(TN,TCELL,heights);
+        terrain.materials[0].shader = litShader;
+        buildVeh();
+    };
+
     buildVeh();
 
     while(!WindowShouldClose()){
@@ -682,6 +703,13 @@ int main(){
         DrawText(TextFormat("gear %s   %s   %d wheels   A/D steer", gname,
                  SURFACES[car.surf].name,(int)car.wheels.size()),
                  (int)scene.x+10,(int)scene.y+8,16,Color{180,188,200,255});
+
+        // terrain selector (regenerates the heightfield + respawns the car)
+        DrawText("TERRAIN",(int)scene.x+scene.width-208,(int)scene.y+10,13,
+                 Color{180,188,200,255});
+        int tmode=terrainMode;
+        GuiToggleGroup({scene.x+scene.width-140,scene.y+6,66,22},"NOISE;FLAT",&tmode);
+        if(tmode!=terrainMode){ terrainMode=tmode; regenTerrain(); }
 
         // --- lower area: plots while running, editor while stopped ---------
         Rectangle lower={330,458,820,252};
