@@ -124,6 +124,8 @@ struct World::Impl {
 
     // wheels (body-space attach offsets)
     std::vector<float> ox, oy, oz;
+    std::vector<Vec3>  brakeAnchor;  // per-wheel static-brake stick point (world)
+    std::vector<char>  brakeStuck;   // 1 = wheel is currently holding statically
     float bodyLen=4, bodyHei=0.8f, bodyWid=1.8f, mass=1300;
     Susp susp;
 };
@@ -191,6 +193,8 @@ void World::buildVehicle(const std::vector<float>& offX,
                          p_->haveChassis=false; }
 
     p_->ox=offX; p_->oy=offY; p_->oz=offZ;
+    p_->brakeAnchor.assign(offX.size(), Vec3::sZero());
+    p_->brakeStuck.assign(offX.size(), 0);
     p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
     wout_.assign(offX.size(), WheelOut{});
 
@@ -221,6 +225,7 @@ void World::resetVehicle(float x,float y,float z){
                               EActivation::Activate);
     bi.SetLinearVelocity (p_->chassis, Vec3::sZero());
     bi.SetAngularVelocity(p_->chassis, Vec3::sZero());
+    std::fill(p_->brakeStuck.begin(), p_->brakeStuck.end(), (char)0);
 }
 
 // ----------------------------- obstacles ------------------------------------
@@ -332,17 +337,32 @@ void World::step(float dt, const std::vector<float>& driveN,
                 Flat = std::max(-cap, std::min(cap, Flat));
                 bi.AddForce(p_->chassis, wr*Flat, RVec3(contact));
 
-                // brake: damp forward motion at the contact
+                // brake: a static-friction hold along the wheel-forward axis.
+                // We anchor the contact point and pull it back with a PD force
+                // (spring+damper) so a stopped car HOLDS on a slope instead of
+                // creeping down it.  The force is capped by the available grip
+                // (mu*Fz); once exceeded the anchor slides and the tyre skids.
                 if(brake>0.001f){
                     float vfwd = vAtt.Dot(wf);
-                    float Fb = -brake*2200.0f*std::tanh(vfwd*2.0f);
+                    if(!p_->brakeStuck[i]){ p_->brakeAnchor[i]=contact;
+                                            p_->brakeStuck[i]=1; }
+                    float xlong = (contact - p_->brakeAnchor[i]).Dot(wf);
+                    float Fb  = -(s.stiffness*xlong + s.damping*vfwd)*brake;
+                    float cap = mu*Fz;
+                    if(std::fabs(Fb) > cap){              // grip lost -> skid
+                        Fb = Fb>0 ? cap : -cap;
+                        p_->brakeAnchor[i]=contact;       // let the anchor slide
+                    }
                     bi.AddForce(p_->chassis, wf*Fb, RVec3(contact));
+                } else {
+                    p_->brakeStuck[i]=0;
                 }
 
                 wo.grounded=1; wo.Fz=Fz;
                 wo.compress = std::max(0.0f,std::min(1.0f, compression/std::max(0.01f,s.travel)));
                 wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
             } else {
+                p_->brakeStuck[i]=0;                  // airborne -> no static hold
                 Vec3 centre = Vec3(attach) + down*s.rest;
                 wo.grounded=0; wo.Fz=0; wo.compress=0;
                 wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();

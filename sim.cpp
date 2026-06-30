@@ -221,12 +221,19 @@ void Vehicle::step(double dt,double throttle,double brake){
 
         double Tdrive = wh.driven ? Tdriven : 0.0;
 
-        // brake torque opposes spin; don't drive omega through zero in one step
-        double Tbrake = brake*1600.0;
-        double Tb = -sgn(wh.omega)*Tbrake;
-        if(std::fabs(wh.omega) < 1e-3) Tb = 0.0;
-
-        wh.omega += dt*(Tdrive + Tlock[i] - Treact + Tb)/wh.I;
+        // integrate drive + tyre reaction first, then apply the brake as a
+        // clamp toward zero: it can LOCK the wheel (omega -> 0, a skid) but can
+        // never spin it the other way.  Without this clamp the tyre reaction of
+        // a sliding car spins a braked wheel backwards.
+        // Brake authority must exceed the low-gear driveline torque, otherwise
+        // the engine keeps spinning the driven wheels through the clutch and
+        // they never lock (most visible in 1st gear on ice).  At full lock the
+        // wheels then drag the engine down and stall it, as in real life.
+        double omega2  = wh.omega + dt*(Tdrive + Tlock[i] - Treact)/wh.I;
+        double dwBrake = brake*4000.0*dt/wh.I;     // max |domega| the brake removes
+        if(omega2 > 0.0) omega2 = std::max(0.0, omega2 - dwBrake);
+        else             omega2 = std::min(0.0, omega2 + dwBrake);
+        wh.omega = omega2;
         wh.angle += wh.omega*dt;
 
         Fx_total += wh.Fx;
