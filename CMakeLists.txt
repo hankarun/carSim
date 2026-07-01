@@ -59,3 +59,12 @@ if(APPLE)
     target_link_libraries(carsim PRIVATE
         "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
 endif()
+
+# ---- ship simulator (second executable) ------------------------------------
+add_executable(shipsim ship_main.cpp ocean.cpp ship.cpp)
+target_include_directories(shipsim PRIVATE ${raygui_SOURCE_DIR}/src)
+target_link_libraries(shipsim PRIVATE raylib)
+if(APPLE)
+    target_link_libraries(shipsim PRIVATE
+        "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
+endif()

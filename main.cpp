@@ -38,13 +38,16 @@ static void DrawGauge(Vector2 c,float R,double val,double maxv,
     }
     double f = clampd(val/maxv,0,1);
     double a=(135 - f*270.0)*DEG2RAD;
-    DrawLineEx(c,{(float)(c.x+std::cos(a)*(R-16)),(float)(c.y-std::sin(a)*(R-16))},
-               4,Color{240,200,90,255});
-    DrawCircle((int)c.x,(int)c.y,5,Color{240,200,90,255});
-    int lw=MeasureText(label,16);
-    DrawText(label,(int)c.x-lw/2,(int)c.y+R-30,16,Color{150,160,175,255});
-    int rw=MeasureText(readout,22);
-    DrawText(readout,(int)c.x-rw/2,(int)c.y+18,22,RAYWHITE); // below needle pivot
+    DrawLineEx(c,{(float)(c.x+std::cos(a)*(R-R*0.15f)),(float)(c.y-std::sin(a)*(R-R*0.15f))},
+               std::max(2.0f,R*0.04f),Color{240,200,90,255});
+    DrawCircle((int)c.x,(int)c.y,std::max(3.0f,R*0.05f),Color{240,200,90,255});
+    // proportional text so the gauge reads at any size
+    int lf=std::max(9,(int)(R*0.20f));         // label font
+    int rf=std::max(13,(int)(R*0.32f));        // readout font
+    int lw=MeasureText(label,lf);
+    DrawText(label,(int)c.x-lw/2,(int)(c.y+R*0.50f),lf,Color{150,160,175,255});
+    int rw=MeasureText(readout,rf);
+    DrawText(readout,(int)c.x-rw/2,(int)(c.y+R*0.14f),rf,RAYWHITE);
 }
 
 struct Plot {
@@ -70,15 +73,18 @@ static void DrawPlot(Rectangle r,const Plot& p,float lo,float hi,Color col,
 }
 
 // ----------------------------- terrain --------------------------------------
+static bool gFlatTerrain = false;   // selectable: noise hills vs flat plane
+
 // analytic heightmap in WORLD metres so the bump density stays constant no
 // matter how big the map is; flattened near the spawn origin.
 static float terrainH(float wx,float wz){
+    if(gFlatTerrain) return 0.0f;
     float h = std::sin(wx*0.18f)*std::cos(wz*0.15f)*2.4f     // big rolling hills
             + std::sin((wx+wz)*0.11f)*1.2f
             + std::sin(wx*0.45f)*std::cos(wz*0.40f)*0.8f       // medium bumps
             + std::cos(wx*0.75f+wz*0.62f)*0.35f;               // fine chatter
     float d = std::sqrt(wx*wx+wz*wz);
-    float flat = (float)clampd(1.0-d/16.0,0.0,1.0);    // ~16 m flat spawn pad
+    float flat = (float)clampd((22.0-d)/8.0,0.0,1.0);  // flat within 14m, blend to 22
     return h*(1.0f-flat);
 }
 
@@ -169,12 +175,17 @@ static Model BuildTerrainModel(int N,float cell,const std::vector<float>& h){
 
 // ----------------------------- 3D scene -------------------------------------
 // Renders the heightmap + the Jolt rigid-body car (free to pitch/roll/yaw) with
-// a smoothed chase camera, into an off-screen texture sized to `view`.
+// an orbit camera (drag to rotate, wheel to zoom) that follows the vehicle.
 static Vector3 gCamPos = {6.0f,5.0f,8.0f};
+static float   gOrbitYaw=2.4f, gOrbitPitch=0.5f, gOrbitDist=12.0f;
 static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
-                        Model terrain, int monWheel, bool spin){
+                        Model terrain, int monWheel, bool spin, Vector3 com){
     static RenderTexture2D rt{};
-    if(rt.id==0) rt = LoadRenderTexture((int)view.width,(int)view.height);
+    if(rt.id==0 || rt.texture.width!=(int)view.width
+                || rt.texture.height!=(int)view.height){
+        if(rt.id!=0) UnloadRenderTexture(rt);
+        rt = LoadRenderTexture((int)view.width,(int)view.height);
+    }
 
     float bp[3]; world.bodyPosition(bp);
     float bq[4]; world.bodyQuat(bq);
@@ -184,12 +195,26 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     Vector3 up   = Vector3RotateByQuaternion({0,1,0},q);
     Vector3 right= Vector3RotateByQuaternion({0,0,1},q);
 
-    // chase camera: behind + above the car, smoothed
-    Vector3 want = Vector3Add(pos, Vector3Add(Vector3Scale(fwd,-7.5f),
-                                              Vector3{0,3.6f,0}));
-    gCamPos = Vector3Lerp(gCamPos, want, 0.12f);
+    // --- orbit controls: drag inside the view to rotate, wheel to zoom -----
+    if(CheckCollisionPointRec(GetMousePosition(),view)){
+        if(IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
+           IsMouseButtonDown(MOUSE_BUTTON_RIGHT)){
+            Vector2 d=GetMouseDelta();
+            gOrbitYaw   -= d.x*0.006f;
+            gOrbitPitch += d.y*0.006f;
+            gOrbitPitch  = (float)clampd(gOrbitPitch,0.08f,1.45f);
+        }
+        float wheel=GetMouseWheelMove();
+        if(wheel!=0) gOrbitDist=(float)clampd(gOrbitDist-wheel*1.5f,4.0f,45.0f);
+    }
+    Vector3 tgt = Vector3Add(pos,(Vector3){0,0.5f,0});
+    Vector3 off = { std::cos(gOrbitPitch)*std::sin(gOrbitYaw),
+                    std::sin(gOrbitPitch),
+                    std::cos(gOrbitPitch)*std::cos(gOrbitYaw) };
+    Vector3 want = Vector3Add(tgt, Vector3Scale(off, gOrbitDist));
+    gCamPos = Vector3Lerp(gCamPos, want, 0.30f);
     Camera3D cam{};
-    cam.position=gCamPos; cam.target=Vector3Add(pos,Vector3{0,0.5f,0});
+    cam.position=gCamPos; cam.target=tgt;
     cam.up={0,1,0}; cam.fovy=50.0f; cam.projection=CAMERA_PERSPECTIVE;
 
     BeginTextureMode(rt);
@@ -209,6 +234,10 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     DrawCubeWires({0,0,0},dims[0],dims[1],dims[2],Color{120,150,200,255});
     rlPopMatrix();
 
+    // centre-of-mass marker (red sphere)
+    Vector3 comW=Vector3Add(pos,Vector3RotateByQuaternion({com.x,com.y,com.z},q));
+    DrawSphere(comW,0.13f,Color{235,80,70,255});
+
     // wheels: positions come from the raycast suspension
     const auto& wo = world.wheels();
     for(size_t i=0;i<wo.size();++i){
@@ -225,11 +254,54 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
             (int)i==monWheel?Color{150,200,240,255}:Color{110,114,124,255});
         if(!wo[i].grounded)   // mark airborne wheels
             DrawSphere(c,0.05f,Color{240,160,90,255});
-        // spin spoke lies in the wheel plane (spanned by fwd & up)
+        // spin spokes drawn on the OUTER rim faces (so they aren't hidden
+        // inside the solid cylinder); the wheel plane is spanned by fwd & up
         float aa=(i<car.wheels.size())?(float)car.wheels[i].angle:0.0f;
-        Vector3 spoke=Vector3Add(Vector3Scale(fwd,std::cos(aa)*wr*0.9f),
-                                 Vector3Scale(up,std::sin(aa)*wr*0.9f));
-        DrawLine3D(c,Vector3Add(c,spoke),Color{210,214,224,255});
+        Vector3 fa=Vector3Add(a,Vector3Scale(right,-0.02f)); // left face, nudged out
+        Vector3 fb=Vector3Add(b,Vector3Scale(right, 0.02f)); // right face
+        const int SPK=4;
+        for(int s=0;s<SPK;s++){
+            float ang=aa + s*(PI*2.0f/SPK);
+            Vector3 dir=Vector3Add(Vector3Scale(fwd,std::cos(ang)*wr*0.86f),
+                                   Vector3Scale(up, std::sin(ang)*wr*0.86f));
+            Color sc = (s==0)?Color{245,210,120,255}:Color{210,214,224,255};
+            DrawLine3D(fa,Vector3Add(fa,dir),sc);
+            DrawLine3D(fb,Vector3Add(fb,dir),sc);
+        }
+    }
+
+    // obstacles: ramps (wedges) + crates (boxes)
+    for(const phys::ObstacleOut& o : world.obstacles()){
+        Quaternion oq={o.qx,o.qy,o.qz,o.qw};
+        Vector3 op={o.px,o.py,o.pz};
+        if(o.kind==0){                                   // crate
+            rlPushMatrix();
+            rlTranslatef(op.x,op.y,op.z);
+            Vector3 ax; float an; QuaternionToAxisAngle(oq,&ax,&an);
+            if(Vector3Length(ax)>0.001f) rlRotatef(an*RAD2DEG,ax.x,ax.y,ax.z);
+            float s=o.sx*2.0f;
+            DrawCube({0,0,0},s,s,s,Color{150,95,55,255});
+            DrawCubeWires({0,0,0},s,s,s,Color{40,28,20,255});
+            rlPopMatrix();
+        } else {                                         // ramp wedge
+            float hL=o.sx*0.5f, h=o.sy, hw=o.sz*0.5f;
+            Vector3 lv[6]={{-hL,0,-hw},{-hL,0,hw},{hL,0,-hw},
+                           {hL,0,hw},{hL,h,-hw},{hL,h,hw}};
+            Vector3 wv[6];
+            for(int k=0;k<6;k++) wv[k]=Vector3Add(op,Vector3RotateByQuaternion(lv[k],oq));
+            Color fill={78,90,108,255}, wire={150,160,175,255};
+            rlDisableBackfaceCulling();
+            DrawTriangle3D(wv[0],wv[1],wv[5],fill); DrawTriangle3D(wv[0],wv[5],wv[4],fill);
+            DrawTriangle3D(wv[0],wv[2],wv[3],fill); DrawTriangle3D(wv[0],wv[3],wv[1],fill);
+            DrawTriangle3D(wv[2],wv[4],wv[5],fill); DrawTriangle3D(wv[2],wv[5],wv[3],fill);
+            DrawTriangle3D(wv[0],wv[4],wv[2],fill); DrawTriangle3D(wv[1],wv[3],wv[5],fill);
+            rlEnableBackfaceCulling();
+            DrawLine3D(wv[0],wv[1],wire); DrawLine3D(wv[2],wv[3],wire);
+            DrawLine3D(wv[4],wv[5],wire); DrawLine3D(wv[0],wv[2],wire);
+            DrawLine3D(wv[1],wv[3],wire); DrawLine3D(wv[2],wv[4],wire);
+            DrawLine3D(wv[3],wv[5],wire); DrawLine3D(wv[0],wv[4],wire);
+            DrawLine3D(wv[1],wv[5],wire);
+        }
     }
 
     EndMode3D();
@@ -258,14 +330,14 @@ static int cycler(float x,float y,const char* label,int val,int lo,int hi){
 
 static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
                        int& wheelSel, int& diffSel, int& pointSel, int& gearSel,
-                       phys::Susp& susp, int& suspPreset){
+                       phys::Susp& susp, int& suspPreset, Vector3& com){
     DrawRectangleRec(panel,Color{26,28,34,255});
     DrawRectangleLinesEx(panel,1,Color{60,64,74,255});
     DrawText("DRIVETRAIN EDITOR  (sim stopped)",(int)panel.x+12,(int)panel.y+8,16,
              Color{120,220,140,255});
 
-    GuiToggleGroup({panel.x+12,panel.y+30,84,26},
-                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH;SUSP",&tab);
+    GuiToggleGroup({panel.x+12,panel.y+30,76,26},
+                   "WHEELS;DIFFS;ENGINE;GEARS;CLUTCH;BODY;SUSP",&tab);
 
     float cx=panel.x+16, cy=panel.y+70;
 
@@ -419,6 +491,25 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         DrawText("More plates -> more torque before the clutch slips.",
                  (int)cx,(int)cy+132,13,Color{120,128,140,255});
     }
+    // ----------------------------- BODY (mass + CoM) -----------------------
+    else if(tab==5){
+        dSlider({cx+130,cy+4,210,20},"Vehicle mass",car.mass,600.0f,3000.0f,"%.0f kg");
+
+        DrawText("Centre of mass offset (body space)",(int)cx,(int)cy+38,14,
+                 Color{150,160,175,255});
+        auto fsl=[&](Rectangle r,const char*l,float&v,float lo,float hi){
+            GuiSlider(r,l,TextFormat("%+.2f m",v),&v,lo,hi); };
+        fsl({cx+150,cy+62,190,18}, "Fwd/back X", com.x,-1.20f,1.20f);
+        fsl({cx+150,cy+86,190,18}, "Up/down Y",  com.y,-0.40f,0.50f);
+        fsl({cx+150,cy+110,190,18},"Left/right Z",com.z,-0.70f,0.70f);
+
+        int lx=(int)panel.x+440, ly=(int)panel.y+64;
+        DrawText(TextFormat("mass: %.0f kg",car.mass),lx,ly,15,Color{120,200,240,255});
+        DrawText("Red sphere in the 3D view = CoM.",lx,ly+26,13,Color{120,128,140,255});
+        DrawText("Forward CoM -> more front grip;",lx,ly+48,13,Color{120,128,140,255});
+        DrawText("lower CoM -> resists rollover.",lx,ly+64,13,Color{120,128,140,255});
+        DrawText("Changes apply when you press PLAY.",lx,ly+90,13,Color{200,180,120,255});
+    }
     // ----------------------------- SUSPENSION ------------------------------
     else {
         DrawText("Preset",(int)cx,(int)cy+4,16,Color{150,160,175,255});
@@ -447,9 +538,10 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
 
 // ----------------------------- main -----------------------------------------
 int main(){
-    const int W=1180,H=720;
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    int W=1180,H=720;
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(W,H,"Drivetrain Simulator  -  configurable engine | clutch | diffs | wheels");
+    SetWindowMinSize(1080,680);
     SetTargetFPS(60);
     GuiSetStyle(DEFAULT,TEXT_SIZE,16);
 
@@ -499,6 +591,7 @@ int main(){
 
     int        suspPreset = phys::SUSP_SPORT;
     phys::Susp susp = phys::suspPreset(suspPreset);
+    Vector3    com  = {0,0,0};      // centre-of-mass offset (body space, m)
 
     // (re)build the rigid-body car from the current wheel configuration
     auto buildVeh=[&](){
@@ -513,10 +606,42 @@ int main(){
         float blen=std::max((maxx-minx)+0.6f,1.2f);
         float bwid=std::max((maxz-minz)+0.2f,0.8f);
         world.setSusp(susp);
-        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f);
+        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f,
+                           com.x,com.y,com.z);
         car.reset();
     };
+
+    // regenerate the heightfield + terrain mesh for the chosen mode (noise/flat)
+    int terrainMode=0;             // 0 = noise hills, 1 = flat
+    auto regenTerrain=[&](){
+        gFlatTerrain = (terrainMode==1);
+        for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++){
+            float wx=-TSPAN*0.5f+TCELL*ix, wz=-TSPAN*0.5f+TCELL*iz;
+            heights[(size_t)iz*TN+ix]=terrainH(wx,wz);
+        }
+        world.setHeightfield(TN,TCELL,heights);
+        spawnH = heights[(size_t)(TN/2)*TN + (TN/2)] + 1.6f;
+        terrain.materials[0].shader.id = rlGetShaderIdDefault(); // detach (keep litShader)
+        UnloadModel(terrain);
+        terrain = BuildTerrainModel(TN,TCELL,heights);
+        terrain.materials[0].shader = litShader;
+        buildVeh();
+    };
+
     buildVeh();
+
+    // obstacles on the flat spawn area: ramps to jump + crates to crash
+    world.addRamp(  9.0f,0.0f,  1.5f, 0.0f, 9.0f,1.7f,6.0f);  // jump ahead (+X)
+    world.addRamp(-10.0f,0.0f, -3.0f, PI,   8.0f,1.4f,5.0f);  // ramp facing back
+    {   // a little pyramid of crates to smash through
+        float bx=6.0f, bz=-8.0f, hh=0.6f;
+        for(int r=0;r<3;r++) for(int cc=0;cc<3-r;cc++)
+            world.addCrate(bx + cc*1.3f + r*0.65f,
+                           hh + r*(2.0f*hh+0.04f) + 0.1f, bz, hh, 35.0f);
+        world.addCrate(10.5f,1.0f, 6.0f,0.6f,30.0f);          // loose ones
+        world.addCrate(12.0f,1.0f, 6.6f,0.6f,30.0f);
+        world.addCrate(-5.0f,1.0f, 9.0f,0.7f,45.0f);
+    }
 
     while(!WindowShouldClose()){
         // ---- input (keyboard adds to the sliders) -------------------------
@@ -538,7 +663,7 @@ int main(){
         if(IsKeyPressed(KEY_P))     running=!running;          // toggle play/stop
         if(IsKeyPressed(KEY_M))     soundOn=!soundOn;          // mute/unmute sound
         if(IsKeyPressed(KEY_R)) { car.reset(); world.resetVehicle(0,spawnH,0);
-                                  throttle=brake=0; clutchEng=1; }
+                                  world.resetObstacles(); throttle=brake=0; clutchEng=1; }
 
         car.clu.engagement = clutchEng;
         world.setSusp(susp);
@@ -612,11 +737,19 @@ int main(){
         }
 
         // ===================== render ======================================
+        W=GetScreenWidth(); H=GetScreenHeight();
+        // responsive layout: fixed left panel, big 3D view, lower plots/editor
+        const float PANELW=300.0f, M=10.0f;
+        Rectangle scene={PANELW+M, M, (float)W-(PANELW+2*M),
+                         (float)(H-3*M)*0.64f};
+        Rectangle lower={scene.x, scene.y+scene.height+M, scene.width,
+                         (float)H-(scene.y+scene.height+2*M)};
+
         BeginDrawing();
         ClearBackground(Color{18,20,25,255});
 
         // --- left: live controls (raygui) ----------------------------------
-        DrawRectangle(0,0,300,H,Color{26,28,34,255});
+        DrawRectangle(0,0,(int)PANELW,H,Color{26,28,34,255});
         DrawText("PARAMETERS",20,16,18,Color{150,160,175,255});
         GuiSlider({110,52,150,22},"Throttle",TextFormat("%.2f",throttle),&throttle,0,1);
         GuiSlider({110,82,150,22},"Clutch",  TextFormat("%.2f",clutchEng),&clutchEng,0,1);
@@ -640,7 +773,8 @@ int main(){
         if(GuiButton({20,228,170,30}, running?"#132#STOP  (P)":"#131#PLAY  (P)"))
             running=!running;
         GuiSetStyle(BUTTON,BASE_COLOR_NORMAL,prevBase);
-        if(GuiButton({200,228,80,30},"Reset")){ car.reset(); throttle=brake=0; clutchEng=1; }
+        if(GuiButton({200,228,80,30},"Reset")){ car.reset(); world.resetVehicle(0,spawnH,0);
+            world.resetObstacles(); throttle=brake=0; clutchEng=1; }
         DrawText(running?"SIM: RUNNING":"SIM: STOPPED (editable)",20,266,14,
                  running?Color{120,220,140,255}:Color{240,200,90,255});
 
@@ -670,23 +804,30 @@ int main(){
             DrawText("ENGINE STALLED\n-> clutch in / neutral to restart",20,ry+22,14,
                      Color{240,160,90,255});
 
-        // --- gauges --------------------------------------------------------
-        DrawGauge({470,150},110,rpm,7000,"RPM x1000",
-                  TextFormat("%.1f",rpm/1000.0), car.eng.redline/7000.0);
-        DrawGauge({470+260,150},110,std::fabs(kmh),220,"km/h",
-                  TextFormat("%.0f",std::fabs(kmh)),1.0);
-
-        // --- 3D scene: heightmap + rigid-body car --------------------------
-        Rectangle scene={330,278,820,170};
-        DrawScene3D(scene, world, car, terrain, mon, spin);
+        // --- 3D scene: heightmap + rigid-body car (big) --------------------
+        DrawScene3D(scene, world, car, terrain, mon, spin, com);
         DrawText(TextFormat("gear %s   %s   %d wheels   A/D steer", gname,
                  SURFACES[car.surf].name,(int)car.wheels.size()),
                  (int)scene.x+10,(int)scene.y+8,16,Color{180,188,200,255});
+        DrawText("drag to orbit  -  wheel to zoom",(int)scene.x+10,(int)scene.y+28,
+                 13,Color{120,128,140,255});
+
+        // terrain selector (regenerates the heightfield + respawns the car)
+        int tmode=terrainMode;
+        GuiToggleGroup({scene.x+scene.width-150,scene.y+8,68,22},"NOISE;FLAT",&tmode);
+        if(tmode!=terrainMode){ terrainMode=tmode; regenTerrain(); }
+
+        // --- small gauges in the bottom corners of the 3D view -------------
+        float gR=std::min(70.0f, scene.width*0.075f);
+        DrawGauge({scene.x+gR+14, scene.y+scene.height-gR-14}, gR,
+                  rpm,7000,"RPM x1000",TextFormat("%.1f",rpm/1000.0),
+                  car.eng.redline/7000.0);
+        DrawGauge({scene.x+scene.width-gR-14, scene.y+scene.height-gR-14}, gR,
+                  std::fabs(kmh),220,"km/h",TextFormat("%.0f",std::fabs(kmh)),1.0);
 
         // --- lower area: plots while running, editor while stopped ---------
-        Rectangle lower={330,458,820,252};
         if(running){
-            float py=lower.y, pw=400, ph=116;
+            float pw=(lower.width-20)*0.5f, ph=(lower.height-14)*0.5f, py=lower.y;
             DrawPlot({lower.x,py,pw,ph},pRPM,0,7000,Color{240,200,90,255},"engine rpm");
             DrawPlot({lower.x,py,pw,ph},pWheel,0,7000,Color{120,200,240,255},
                      "wheel-equiv rpm",NAN);
@@ -705,11 +846,11 @@ int main(){
                 DrawText("green = +/-k_peak (past it = sliding)",
                          (int)r.x+6,(int)(r.y+r.height-18),12,Color{120,128,140,255});
             }
-            DrawPlot({lower.x,py+ph+14,pw*2+20,ph},pForce,-6000,6000,
+            DrawPlot({lower.x,py+ph+14,lower.width,ph},pForce,-6000,6000,
                      Color{150,220,150,255},"monitored longitudinal force Fx [N]",0.0f);
         } else {
             DrawEditor(lower, car, editTab, wheelSel, diffSel, pointSel, gearSel,
-                       susp, suspPreset);
+                       susp, suspPreset, com);
         }
 
         EndDrawing();

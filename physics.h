@@ -36,6 +36,15 @@ struct WheelOut {
     float compress=0;    // 0 (extended) .. 1 (fully compressed)
 };
 
+// ----- obstacle (ramp / crate) world transform for rendering ----------------
+struct ObstacleOut {
+    int   kind=0;        // 0 = crate (box), 1 = ramp (wedge)
+    float px=0,py=0,pz=0;
+    float qx=0,qy=0,qz=0,qw=1;
+    float sx=1,sy=1,sz=1; // crate: half-extents ; ramp: (length,height,width)
+    int   dynamic=0;
+};
+
 class World {
 public:
     World();
@@ -55,7 +64,8 @@ public:
                       const std::vector<float>& offY,
                       const std::vector<float>& offZ,
                       float bodyLen,float bodyHei,float bodyWid,float mass,
-                      float spawnX,float spawnY,float spawnZ);
+                      float spawnX,float spawnY,float spawnZ,
+                      float comX=0,float comY=0,float comZ=0); // COM offset (body space)
     bool hasVehicle() const;
     void setSusp(const Susp& s);
     void resetVehicle(float x,float y,float z);
@@ -72,10 +82,18 @@ public:
     float forwardSpeed() const;               // along body +X [m/s]
     const std::vector<WheelOut>& wheels() const { return wout_; }
 
+    // obstacles ------------------------------------------------------------
+    void addCrate(float x,float y,float z,float half,float mass);
+    void addRamp (float x,float y,float z,float yawRad,
+                  float length,float height,float width);
+    void resetObstacles();                    // dynamic crates back to spawn
+    const std::vector<ObstacleOut>& obstacles() const { return obs_; }
+
 private:
     struct Impl;
     Impl* p_;
-    std::vector<WheelOut> wout_;
+    std::vector<WheelOut>    wout_;
+    std::vector<ObstacleOut> obs_;
 };
 
 } // namespace phys

@@ -18,6 +18,8 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -112,6 +114,9 @@ struct World::Impl {
     BodyID chassis;
     bool   haveChassis = false;
 
+    std::vector<BodyID>      obsId;     // obstacle bodies
+    std::vector<ObstacleOut> obsInit;   // spawn transforms (for reset)
+
     // terrain
     int   hmN    = 0;
     float hmCell = 2.0f;
@@ -119,6 +124,8 @@ struct World::Impl {
 
     // wheels (body-space attach offsets)
     std::vector<float> ox, oy, oz;
+    std::vector<Vec3>  brakeAnchor;  // per-wheel static-brake stick point (world)
+    std::vector<char>  brakeStuck;   // 1 = wheel is currently holding statically
     float bodyLen=4, bodyHei=0.8f, bodyWid=1.8f, mass=1300;
     Susp susp;
 };
@@ -137,6 +144,7 @@ World::World() {
 
 World::~World() {
     BodyInterface& bi = p_->sys.GetBodyInterface();
+    for(BodyID id : p_->obsId){ bi.RemoveBody(id); bi.DestroyBody(id); }
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis); }
     if(!p_->ground.IsInvalid()){ bi.RemoveBody(p_->ground); bi.DestroyBody(p_->ground); }
     delete p_->jobs;
@@ -178,17 +186,23 @@ void World::buildVehicle(const std::vector<float>& offX,
                          const std::vector<float>& offY,
                          const std::vector<float>& offZ,
                          float bodyLen,float bodyHei,float bodyWid,float mass,
-                         float spawnX,float spawnY,float spawnZ){
+                         float spawnX,float spawnY,float spawnZ,
+                         float comX,float comY,float comZ){
     BodyInterface& bi = p_->sys.GetBodyInterface();
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis);
                          p_->haveChassis=false; }
 
     p_->ox=offX; p_->oy=offY; p_->oz=offZ;
+    p_->brakeAnchor.assign(offX.size(), Vec3::sZero());
+    p_->brakeStuck.assign(offX.size(), 0);
     p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
     wout_.assign(offX.size(), WheelOut{});
 
+    // box chassis, wrapped so its centre of mass can be shifted (body space)
     BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
-    ShapeSettings::ShapeResult res = boxS.Create();
+    ShapeRefC boxShape = boxS.Create().Get();
+    OffsetCenterOfMassShapeSettings comS(Vec3(comX,comY,comZ), boxShape);
+    ShapeSettings::ShapeResult res = comS.Create();
     BodyCreationSettings bcs(res.Get(),
         RVec3(spawnX,spawnY,spawnZ), Quat::sIdentity(),
         EMotionType::Dynamic, Layers::MOVING);
@@ -211,13 +225,63 @@ void World::resetVehicle(float x,float y,float z){
                               EActivation::Activate);
     bi.SetLinearVelocity (p_->chassis, Vec3::sZero());
     bi.SetAngularVelocity(p_->chassis, Vec3::sZero());
+    std::fill(p_->brakeStuck.begin(), p_->brakeStuck.end(), (char)0);
+}
+
+// ----------------------------- obstacles ------------------------------------
+void World::addCrate(float x,float y,float z,float half,float mass){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    BoxShapeSettings bs(Vec3(half,half,half));
+    BodyCreationSettings bcs(bs.Create().Get(), RVec3(x,y,z), Quat::sIdentity(),
+                             EMotionType::Dynamic, Layers::MOVING);
+    bcs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+    bcs.mMassPropertiesOverride.mMass = mass;
+    Body* b = bi.CreateBody(bcs);
+    bi.AddBody(b->GetID(), EActivation::Activate);
+    p_->obsId.push_back(b->GetID());
+    ObstacleOut o; o.kind=0; o.px=x;o.py=y;o.pz=z; o.qw=1;
+    o.sx=o.sy=o.sz=half; o.dynamic=1;
+    obs_.push_back(o); p_->obsInit.push_back(o);
+}
+
+void World::addRamp(float x,float y,float z,float yawRad,
+                    float L,float h,float w){
+    float hL=L*0.5f, hw=w*0.5f;
+    Array<Vec3> pts;                         // centred triangular prism
+    pts.push_back(Vec3(-hL,0,-hw)); pts.push_back(Vec3(-hL,0, hw));
+    pts.push_back(Vec3( hL,0,-hw)); pts.push_back(Vec3( hL,0, hw));
+    pts.push_back(Vec3( hL,h,-hw)); pts.push_back(Vec3( hL,h, hw));
+    ConvexHullShapeSettings hs(pts, 0.0f);
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    Quat q = Quat::sRotation(Vec3(0,1,0), yawRad);
+    Body* b = bi.CreateBody(BodyCreationSettings(hs.Create().Get(),
+                RVec3(x,y,z), q, EMotionType::Static, Layers::NON_MOVING));
+    bi.AddBody(b->GetID(), EActivation::DontActivate);
+    p_->obsId.push_back(b->GetID());
+    ObstacleOut o; o.kind=1; o.px=x;o.py=y;o.pz=z;
+    o.qx=q.GetX();o.qy=q.GetY();o.qz=q.GetZ();o.qw=q.GetW();
+    o.sx=L;o.sy=h;o.sz=w; o.dynamic=0;
+    obs_.push_back(o); p_->obsInit.push_back(o);
+}
+
+void World::resetObstacles(){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        const ObstacleOut& s=p_->obsInit[i];
+        bi.SetPositionAndRotation(p_->obsId[i], RVec3(s.px,s.py,s.pz),
+            Quat(s.qx,s.qy,s.qz,s.qw), EActivation::Activate);
+        bi.SetLinearVelocity (p_->obsId[i], Vec3::sZero());
+        bi.SetAngularVelocity(p_->obsId[i], Vec3::sZero());
+        obs_[i]=s;
+    }
 }
 
 void World::step(float dt, const std::vector<float>& driveN,
                  float brake, float steerRad, float mu){
     if(p_->haveChassis){
         BodyInterface& bi = p_->sys.GetBodyInterface();
-        RVec3 bp = bi.GetCenterOfMassPosition(p_->chassis);
+        RVec3 bp = bi.GetPosition(p_->chassis);     // shape origin (box centre)
         Quat  bq = bi.GetRotation(p_->chassis);
         Vec3  up    = bq*Vec3(0,1,0);
         Vec3  fwd   = bq*Vec3(1,0,0);
@@ -273,17 +337,32 @@ void World::step(float dt, const std::vector<float>& driveN,
                 Flat = std::max(-cap, std::min(cap, Flat));
                 bi.AddForce(p_->chassis, wr*Flat, RVec3(contact));
 
-                // brake: damp forward motion at the contact
+                // brake: a static-friction hold along the wheel-forward axis.
+                // We anchor the contact point and pull it back with a PD force
+                // (spring+damper) so a stopped car HOLDS on a slope instead of
+                // creeping down it.  The force is capped by the available grip
+                // (mu*Fz); once exceeded the anchor slides and the tyre skids.
                 if(brake>0.001f){
                     float vfwd = vAtt.Dot(wf);
-                    float Fb = -brake*2200.0f*std::tanh(vfwd*2.0f);
+                    if(!p_->brakeStuck[i]){ p_->brakeAnchor[i]=contact;
+                                            p_->brakeStuck[i]=1; }
+                    float xlong = (contact - p_->brakeAnchor[i]).Dot(wf);
+                    float Fb  = -(s.stiffness*xlong + s.damping*vfwd)*brake;
+                    float cap = mu*Fz;
+                    if(std::fabs(Fb) > cap){              // grip lost -> skid
+                        Fb = Fb>0 ? cap : -cap;
+                        p_->brakeAnchor[i]=contact;       // let the anchor slide
+                    }
                     bi.AddForce(p_->chassis, wf*Fb, RVec3(contact));
+                } else {
+                    p_->brakeStuck[i]=0;
                 }
 
                 wo.grounded=1; wo.Fz=Fz;
                 wo.compress = std::max(0.0f,std::min(1.0f, compression/std::max(0.01f,s.travel)));
                 wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
             } else {
+                p_->brakeStuck[i]=0;                  // airborne -> no static hold
                 Vec3 centre = Vec3(attach) + down*s.rest;
                 wo.grounded=0; wo.Fz=0; wo.compress=0;
                 wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
@@ -293,12 +372,22 @@ void World::step(float dt, const std::vector<float>& driveN,
     }
 
     p_->sys.Update(dt, 2, p_->temp, p_->jobs);
+
+    // refresh dynamic obstacle (crate) transforms for rendering
+    BodyInterface& bi2 = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        RVec3 p = bi2.GetPosition(p_->obsId[i]);
+        Quat  q = bi2.GetRotation(p_->obsId[i]);
+        obs_[i].px=p.GetX(); obs_[i].py=p.GetY(); obs_[i].pz=p.GetZ();
+        obs_[i].qx=q.GetX(); obs_[i].qy=q.GetY(); obs_[i].qz=q.GetZ(); obs_[i].qw=q.GetW();
+    }
 }
 
 // ----------------------------- read-back ------------------------------------
 void World::bodyPosition(float o[3]) const {
     if(!p_->haveChassis){ o[0]=o[1]=o[2]=0; return; }
-    RVec3 p = p_->sys.GetBodyInterface().GetCenterOfMassPosition(p_->chassis);
+    RVec3 p = p_->sys.GetBodyInterface().GetPosition(p_->chassis);  // shape origin
     o[0]=p.GetX(); o[1]=p.GetY(); o[2]=p.GetZ();
 }
 void World::bodyQuat(float o[4]) const {
