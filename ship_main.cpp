@@ -68,7 +68,7 @@ static Camera3D updateCamera(Vector3 target, bool allowInput){
         float wheel=GetMouseWheelMove();
         if(wheel!=0) gOrbitDist=std::clamp(gOrbitDist-wheel*3.0f,8.0f,140.0f);
     }
-    Vector3 tgt=Vector3Add(target,(Vector3){0,1.5f,0});
+    Vector3 tgt=Vector3Add(target,Vector3{0,1.5f,0});
     Vector3 off={ std::cos(gOrbitPitch)*std::sin(gOrbitYaw),
                   std::sin(gOrbitPitch),
                   std::cos(gOrbitPitch)*std::cos(gOrbitYaw) };

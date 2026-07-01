@@ -207,7 +207,7 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
         float wheel=GetMouseWheelMove();
         if(wheel!=0) gOrbitDist=(float)clampd(gOrbitDist-wheel*1.5f,4.0f,45.0f);
     }
-    Vector3 tgt = Vector3Add(pos,(Vector3){0,0.5f,0});
+    Vector3 tgt = Vector3Add(pos,Vector3{0,0.5f,0});
     Vector3 off = { std::cos(gOrbitPitch)*std::sin(gOrbitYaw),
                     std::sin(gOrbitPitch),
                     std::cos(gOrbitPitch)*std::cos(gOrbitYaw) };
@@ -563,8 +563,8 @@ int main(){
     Plot  pRPM,pWheel,pSlip,pForce;
 
     // --- 3D physics world: heightmap terrain + raycast-suspension vehicle ---
-    const int   TN=128;           // heightfield resolution (bigger map)
-    const float TCELL=2.2f;       // metres between samples -> ~280 m square
+    const int   TN=256;           // heightfield resolution (max for u16 indices)
+    const float TCELL=11.0f;      // metres between samples -> ~2800 m square (10x)
     const float TSPAN=(TN-1)*TCELL;
     std::vector<float> heights((size_t)TN*TN);
     for(int iz=0;iz<TN;iz++) for(int ix=0;ix<TN;ix++){
