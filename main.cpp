@@ -186,10 +186,10 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
 
     // chase camera: behind + above the car, smoothed
     Vector3 want = Vector3Add(pos, Vector3Add(Vector3Scale(fwd,-7.5f),
-                                              (Vector3){0,3.6f,0}));
+                                              Vector3{0,3.6f,0}));
     gCamPos = Vector3Lerp(gCamPos, want, 0.12f);
     Camera3D cam{};
-    cam.position=gCamPos; cam.target=Vector3Add(pos,(Vector3){0,0.5f,0});
+    cam.position=gCamPos; cam.target=Vector3Add(pos,Vector3{0,0.5f,0});
     cam.up={0,1,0}; cam.fovy=50.0f; cam.projection=CAMERA_PERSPECTIVE;
 
     BeginTextureMode(rt);

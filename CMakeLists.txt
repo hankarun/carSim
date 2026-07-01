@@ -34,6 +34,9 @@ set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
 set(TARGET_SAMPLES          OFF CACHE BOOL "" FORCE)
 set(TARGET_VIEWER           OFF CACHE BOOL "" FORCE)
 set(OVERRIDE_CXX_FLAGS      OFF CACHE BOOL "" FORCE)
+# Match the dynamic-debug CRT (/MDd) used by raylib and carsim, otherwise Jolt
+# builds with the static CRT (/MTd) and the link fails with LNK2038 mismatches.
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     JoltPhysics
     GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
