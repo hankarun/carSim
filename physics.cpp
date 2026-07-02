@@ -128,6 +128,12 @@ struct World::Impl {
     std::vector<char>  brakeStuck;   // 1 = wheel is currently holding statically
     float bodyLen=4, bodyHei=0.8f, bodyWid=1.8f, mass=1300;
     Susp susp;
+
+    // tank track state
+    std::vector<char> trackSide;   // per ray: 0 = left track, 1 = right track
+    TrackSusp         tsusp;
+    TrackOut          tout[2];     // per-track aggregate readback (0=L,1=R)
+    bool              isTank = false;
 };
 
 World::World() {
@@ -226,6 +232,166 @@ void World::resetVehicle(float x,float y,float z){
     bi.SetLinearVelocity (p_->chassis, Vec3::sZero());
     bi.SetAngularVelocity(p_->chassis, Vec3::sZero());
     std::fill(p_->brakeStuck.begin(), p_->brakeStuck.end(), (char)0);
+}
+
+// ----------------------------- tank -----------------------------------------
+void World::buildTank(int roadWheelsPerSide, float x0, float x1,
+                      float leftZ, float rightZ, float attachY,
+                      float bodyLen,float bodyHei,float bodyWid,float mass,
+                      float spawnX,float spawnY,float spawnZ,
+                      float comX,float comY,float comZ){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis);
+                         p_->haveChassis=false; }
+
+    // lay out two rows of road-wheel rays: left row first, then right row
+    int n = std::max(1, roadWheelsPerSide);
+    p_->ox.clear(); p_->oy.clear(); p_->oz.clear(); p_->trackSide.clear();
+    for(int side=0; side<2; ++side){
+        float z = side==0 ? leftZ : rightZ;
+        for(int k=0;k<n;++k){
+            float t = (n>1) ? (float)k/(float)(n-1) : 0.5f;
+            p_->ox.push_back(x0 + (x1-x0)*t);
+            p_->oy.push_back(attachY);
+            p_->oz.push_back(z);
+            p_->trackSide.push_back((char)side);
+        }
+    }
+    size_t nr = p_->ox.size();
+    p_->brakeAnchor.assign(nr, Vec3::sZero());
+    p_->brakeStuck.assign(nr, 0);
+    wout_.assign(nr, WheelOut{});
+    p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
+    p_->isTank = true;
+    p_->tout[0]=TrackOut{}; p_->tout[1]=TrackOut{};
+
+    // box hull, wrapped so its centre of mass can be shifted (body space)
+    BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
+    ShapeRefC boxShape = boxS.Create().Get();
+    OffsetCenterOfMassShapeSettings comS(Vec3(comX,comY,comZ), boxShape);
+    ShapeSettings::ShapeResult res = comS.Create();
+    BodyCreationSettings bcs(res.Get(),
+        RVec3(spawnX,spawnY,spawnZ), Quat::sIdentity(),
+        EMotionType::Dynamic, Layers::MOVING);
+    bcs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+    bcs.mMassPropertiesOverride.mMass = mass;
+    bcs.mLinearDamping  = 0.05f;
+    bcs.mAngularDamping = 0.40f;   // extra yaw damping for skid-steer stability
+    // continuous collision so the heavy hull can't tunnel through the terrain
+    bcs.mMotionQuality  = EMotionQuality::LinearCast;
+    Body* b = bi.CreateBody(bcs);
+    p_->chassis = b->GetID();
+    bi.AddBody(p_->chassis, EActivation::Activate);
+    p_->haveChassis = true;
+}
+
+void World::setTrackSusp(const TrackSusp& s){ p_->tsusp=s; }
+const TrackOut& World::track(int side) const { return p_->tout[side&1]; }
+
+void World::stepTank(float dt, float leftSurf, float rightSurf,
+                     float brake, float mu){
+    p_->tout[0]=TrackOut{}; p_->tout[1]=TrackOut{};
+
+    if(p_->haveChassis){
+        BodyInterface& bi = p_->sys.GetBodyInterface();
+        RVec3 bp = bi.GetPosition(p_->chassis);
+        Quat  bq = bi.GetRotation(p_->chassis);
+        Vec3  up    = bq*Vec3(0,1,0);
+        Vec3  fwd   = bq*Vec3(1,0,0);
+        Vec3  right = bq*Vec3(0,0,1);
+
+        const TrackSusp& s = p_->tsusp;
+        float rayLen = s.rest + s.radius;
+        GroundOnlyLayerFilter& gf = p_->groundFilter;
+
+        for(size_t i=0;i<p_->ox.size();++i){
+            int side = p_->trackSide[i];
+            float surf = side==0 ? leftSurf : rightSurf;
+            Vec3 local(p_->ox[i], p_->oy[i], p_->oz[i]);
+            RVec3 attach = bp + bq*local;
+            Vec3  down   = -up;
+
+            RRayCast ray{ attach, down*rayLen };
+            RayCastResult hit;
+            bool grounded = p_->sys.GetNarrowPhaseQuery().CastRay(
+                                ray, hit, BroadPhaseLayerFilter(), gf);
+
+            WheelOut wo{};
+            if(grounded){
+                float d = hit.mFraction*rayLen;
+                float suspLen = std::max(0.0f, d - s.radius);
+                float compression = s.rest - suspLen;
+                Vec3 contact = Vec3(attach) + down*d;
+                Vec3 centre  = Vec3(attach) + down*(d - s.radius);
+
+                Vec3 vAtt = bi.GetPointVelocity(p_->chassis, RVec3(attach));
+                float upVel = vAtt.Dot(up);
+                float Fspring = s.stiffness*compression;
+                float Fdamp   = -s.damping*upVel;
+                float Fz = std::max(0.0f, Fspring + Fdamp);
+                bi.AddForce(p_->chassis, up*Fz, RVec3(attach));
+
+                float cap = mu*Fz;
+
+                // longitudinal thrust from track-vs-ground slip
+                float vfwd  = vAtt.Dot(fwd);
+                float vslip = surf - vfwd;
+                float Ftr   = s.trackK*vslip;
+                Ftr = std::max(-cap, std::min(cap, Ftr));
+                bi.AddForce(p_->chassis, fwd*Ftr, RVec3(contact));
+
+                // lateral grip opposes side slip (this is what makes it yaw)
+                float vlat = vAtt.Dot(right);
+                float Flat = -s.gripK*vlat;
+                Flat = std::max(-cap, std::min(cap, Flat));
+                bi.AddForce(p_->chassis, right*Flat, RVec3(contact));
+
+                // brake: PD static-friction hold along the track-forward axis
+                if(brake>0.001f){
+                    if(!p_->brakeStuck[i]){ p_->brakeAnchor[i]=contact;
+                                            p_->brakeStuck[i]=1; }
+                    float xlong = (contact - p_->brakeAnchor[i]).Dot(fwd);
+                    float Fb  = -(s.stiffness*xlong + s.damping*vfwd)*brake;
+                    if(std::fabs(Fb) > cap){
+                        Fb = Fb>0 ? cap : -cap;
+                        p_->brakeAnchor[i]=contact;
+                    }
+                    bi.AddForce(p_->chassis, fwd*Fb, RVec3(contact));
+                } else {
+                    p_->brakeStuck[i]=0;
+                }
+
+                TrackOut& to = p_->tout[side];
+                to.force += Ftr; to.load += Fz;
+                to.groundedRays++; to.contactSpeed += vfwd;
+
+                wo.grounded=1; wo.Fz=Fz;
+                wo.compress = std::max(0.0f,std::min(1.0f, compression/std::max(0.01f,s.travel)));
+                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
+            } else {
+                p_->brakeStuck[i]=0;
+                Vec3 centre = Vec3(attach) + down*s.rest;
+                wo.grounded=0; wo.Fz=0; wo.compress=0;
+                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
+            }
+            if(i<wout_.size()) wout_[i]=wo;
+        }
+
+        for(int t=0;t<2;t++)
+            if(p_->tout[t].groundedRays>0)
+                p_->tout[t].contactSpeed /= (float)p_->tout[t].groundedRays;
+    }
+
+    p_->sys.Update(dt, 4, p_->temp, p_->jobs);   // 4 substeps for the heavy body
+
+    BodyInterface& bi2 = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        RVec3 p = bi2.GetPosition(p_->obsId[i]);
+        Quat  q = bi2.GetRotation(p_->obsId[i]);
+        obs_[i].px=p.GetX(); obs_[i].py=p.GetY(); obs_[i].pz=p.GetZ();
+        obs_[i].qx=q.GetX(); obs_[i].qy=q.GetY(); obs_[i].qz=q.GetZ(); obs_[i].qw=q.GetW();
+    }
 }
 
 // ----------------------------- obstacles ------------------------------------

@@ -28,6 +28,30 @@ enum SuspPreset { SUSP_SPORT=0, SUSP_COMFORT=1, SUSP_OFFROAD=2, SUSP_COUNT=3 };
 Susp        suspPreset(int which);
 const char* suspPresetName(int which);
 
+// ----- tank track settings (one set, shared by all track rays) --------------
+// The track is modelled as two longitudinal rows of downward rays (left/right).
+// Each ray is a small tyre: spring+damper load, a longitudinal thrust from
+// track-vs-ground slip, and a lateral grip force -- all capped by mu*Fz.
+struct TrackSusp {
+    float rest      = 0.55f;     // natural suspension length [m]
+    float travel    = 0.30f;     // usable compression travel [m]
+    float stiffness = 900000.0f; // spring rate [N/m]  (heavy tank)
+    float damping   = 120000.0f; // damper rate [N s/m]
+    float radius    = 0.35f;     // road-wheel radius [m]
+    float gripK     = 60000.0f;  // lateral grip stiffness [N per m/s]
+    float trackK    = 250000.0f; // longitudinal slip stiffness [N per m/s]
+                                 //   HIGH -> tiny slip carries the load -> the
+                                 //   track "sticks" to the ground (near no-slip)
+};
+
+// ----- per-track aggregate readback (side 0 = left, 1 = right) --------------
+struct TrackOut {
+    float force        = 0;  // summed longitudinal reaction along body +X [N]
+    float load         = 0;  // summed suspension load Fz [N]
+    int   groundedRays = 0;  // how many of this track's rays touched ground
+    float contactSpeed = 0;  // mean along-forward ground speed at contacts [m/s]
+};
+
 // ----- per-wheel output (world space) ---------------------------------------
 struct WheelOut {
     float x=0,y=0,z=0;   // wheel centre, world
@@ -69,6 +93,25 @@ public:
     bool hasVehicle() const;
     void setSusp(const Susp& s);
     void resetVehicle(float x,float y,float z);
+
+    // ----- tracked tank ---------------------------------------------------
+    // Build a tank chassis with two rows of road-wheel rays (left/right track).
+    // roadWheelsPerSide rays are spread evenly along X in [x0,x1] at height
+    // attachY; the left row sits at Z=leftZ, the right row at Z=rightZ.
+    // wheels() is sized to 2*roadWheelsPerSide (left row first, then right).
+    void buildTank(int roadWheelsPerSide, float x0, float x1,
+                   float leftZ, float rightZ, float attachY,
+                   float bodyLen, float bodyHei, float bodyWid, float mass,
+                   float spawnX, float spawnY, float spawnZ,
+                   float comX=0, float comY=0, float comZ=0);
+    void setTrackSusp(const TrackSusp& s);
+
+    // advance one frame in tank mode.  leftSurf/rightSurf are the commanded
+    // TRACK SURFACE SPEEDS [m/s] (sprocket omega * radius) of each track;
+    // brake in [0,1] holds the tank; mu caps longitudinal & lateral grip.
+    void stepTank(float dt, float leftSurf, float rightSurf,
+                  float brake, float mu);
+    const TrackOut& track(int side) const;   // side 0 = left, 1 = right
 
     // advance one frame.  driveN = longitudinal tire force per wheel [N],
     // steerRad steers the front wheels, mu caps lateral grip.

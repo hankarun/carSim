@@ -68,3 +68,12 @@ if(APPLE)
     target_link_libraries(shipsim PRIVATE
         "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
 endif()
+
+# ---- tank simulator (third executable) -------------------------------------
+add_executable(tanksim tank_main.cpp sim.cpp physics.cpp)
+target_include_directories(tanksim PRIVATE ${raygui_SOURCE_DIR}/src)
+target_link_libraries(tanksim PRIVATE raylib Jolt)
+if(APPLE)
+    target_link_libraries(tanksim PRIVATE
+        "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
+endif()
