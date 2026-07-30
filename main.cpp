@@ -238,14 +238,20 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     Vector3 comW=Vector3Add(pos,Vector3RotateByQuaternion({com.x,com.y,com.z},q));
     DrawSphere(comW,0.13f,Color{235,80,70,255});
 
-    // wheels: positions come from the raycast suspension
+    // wheels: transforms come from the Jolt vehicle constraint
     const auto& wo = world.wheels();
     for(size_t i=0;i<wo.size();++i){
         Vector3 c={wo[i].x,wo[i].y,wo[i].z};
-        float wr=(i<car.wheels.size())?(float)car.wheels[i].r:0.42f;
-        float hw=0.16f;
-        Vector3 a=Vector3Subtract(c,Vector3Scale(right,hw));
-        Vector3 b=Vector3Add(c,Vector3Scale(right,hw));
+        float wr=(i<car.wheels.size())?(float)car.wheels[i].r:0.345f;
+        float hw=0.118f;                     // half of a 235-section tyre
+        // steer rotates the wheel basis about the body up axis
+        float st=wo[i].steer;
+        Vector3 wRight=Vector3Add(Vector3Scale(right,std::cos(st)),
+                                  Vector3Scale(fwd,  std::sin(st)));
+        Vector3 wFwd  =Vector3Subtract(Vector3Scale(fwd,  std::cos(st)),
+                                       Vector3Scale(right,std::sin(st)));
+        Vector3 a=Vector3Subtract(c,Vector3Scale(wRight,hw));
+        Vector3 b=Vector3Add(c,Vector3Scale(wRight,hw));
         bool drv=(i<car.wheels.size())&&car.wheels[i].driven;
         bool sp = drv && spin;
         Color tc= sp?Color{200,60,55,255}:(drv?Color{40,44,54,255}:Color{28,30,36,255});
@@ -255,15 +261,15 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
         if(!wo[i].grounded)   // mark airborne wheels
             DrawSphere(c,0.05f,Color{240,160,90,255});
         // spin spokes drawn on the OUTER rim faces (so they aren't hidden
-        // inside the solid cylinder); the wheel plane is spanned by fwd & up
-        float aa=(i<car.wheels.size())?(float)car.wheels[i].angle:0.0f;
-        Vector3 fa=Vector3Add(a,Vector3Scale(right,-0.02f)); // left face, nudged out
-        Vector3 fb=Vector3Add(b,Vector3Scale(right, 0.02f)); // right face
+        // inside the solid cylinder); the wheel plane is spanned by wFwd & up
+        float aa=wo[i].spin;
+        Vector3 fa=Vector3Add(a,Vector3Scale(wRight,-0.02f)); // left face, nudged out
+        Vector3 fb=Vector3Add(b,Vector3Scale(wRight, 0.02f)); // right face
         const int SPK=4;
         for(int s=0;s<SPK;s++){
             float ang=aa + s*(PI*2.0f/SPK);
-            Vector3 dir=Vector3Add(Vector3Scale(fwd,std::cos(ang)*wr*0.86f),
-                                   Vector3Scale(up, std::sin(ang)*wr*0.86f));
+            Vector3 dir=Vector3Add(Vector3Scale(wFwd,std::cos(ang)*wr*0.86f),
+                                   Vector3Scale(up,  std::sin(ang)*wr*0.86f));
             Color sc = (s==0)?Color{245,210,120,255}:Color{210,214,224,255};
             DrawLine3D(fa,Vector3Add(fa,dir),sc);
             DrawLine3D(fb,Vector3Add(fb,dir),sc);
@@ -348,7 +354,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         wheelSel=cycler(cx,cy,TextFormat("Wheel %d / %d",wheelSel+1,N),wheelSel,0,N-1);
 
         if(GuiButton({cx+200,cy,90,26},"Add"))
-            { car.addWheel(0.0,0.0,0.31,false); wheelSel=(int)car.wheels.size()-1; }
+            { car.addWheel(0.0,0.0,0.345,false); wheelSel=(int)car.wheels.size()-1; }
         if(GuiButton({cx+296,cy,90,26},"Remove") && N>1)
             { car.removeWheel(wheelSel); wheelSel=std::min(wheelSel,(int)car.wheels.size()-1); }
 
@@ -417,9 +423,9 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         if(P>0){
             CurvePoint& cp=car.eng.curve[pointSel];
             dSlider({cx+70,cy+42,210,20},"RPM",cp.rpm,0.0f,7500.0f,"%.0f");
-            dSlider({cx+70,cy+70,210,20},"Nm", cp.nm, 0.0f,400.0f,"%.0f");
+            dSlider({cx+70,cy+70,210,20},"Nm", cp.nm, 0.0f,450.0f,"%.0f");
             car.eng.sortCurve();
-            dSlider({cx+70,cy+100,210,20},"Redline",car.eng.redline,3000.0f,7500.0f,"%.0f");
+            dSlider({cx+70,cy+100,210,20},"Redline",car.eng.redline,1500.0f,7500.0f,"%.0f");
         }
 
         // mini torque-curve preview on the right of the panel
@@ -427,7 +433,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         DrawRectangleRec(gr,Color{20,22,28,255});
         DrawRectangleLinesEx(gr,1,Color{60,64,74,255});
         auto GX=[&](double rpm){ return gr.x + (float)(rpm/7500.0)*gr.width; };
-        auto GY=[&](double nm){ return gr.y+gr.height-(float)(nm/400.0)*gr.height; };
+        auto GY=[&](double nm){ return gr.y+gr.height-(float)(nm/450.0)*gr.height; };
         for(size_t i=1;i<car.eng.curve.size();++i)
             DrawLineEx({GX(car.eng.curve[i-1].rpm),GY(car.eng.curve[i-1].nm)},
                        {GX(car.eng.curve[i].rpm),GY(car.eng.curve[i].nm)},2,
@@ -474,6 +480,10 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
             DrawText(TextFormat("%d:  %.2f  x %.2f = %.2f",g,b.ratio[g],b.finalDrive,
                      b.ratio[g]*b.finalDrive),lx,ly+18*g,14,gc);
         }
+        DrawText("Diesel shift points: up 2600-2900 rpm,",lx,ly+18*G+26,13,
+                 Color{200,180,120,255});
+        DrawText("down ~1500 rpm, cruise 1800-2200 rpm.",lx,ly+18*G+42,13,
+                 Color{200,180,120,255});
     }
     // ----------------------------- CLUTCH ----------------------------------
     else if(tab==4){
@@ -483,7 +493,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
         DrawText(TextFormat("%d",c.plates),(int)cx+262,(int)cy+4,18,RAYWHITE);
         if(GuiButton({cx+290,cy,30,26},"+") && c.plates<10) c.plates++;
 
-        dSlider({cx+130,cy+44,200,20},"Per-plate Nm",c.capacityPerPlate,80.0f,400.0f,"%.0f");
+        dSlider({cx+130,cy+44,200,20},"Per-plate Nm",c.capacityPerPlate,80.0f,700.0f,"%.0f");
         dSlider({cx+130,cy+74,200,20},"Lock band",c.band,2.0f,16.0f);
         DrawText(TextFormat("Total clutch capacity: %.0f Nm  (%d x %.0f)",
                  c.capacity(),c.plates,c.capacityPerPlate),
@@ -493,18 +503,19 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
     }
     // ----------------------------- BODY (mass + CoM) -----------------------
     else if(tab==5){
-        dSlider({cx+130,cy+4,210,20},"Vehicle mass",car.mass,600.0f,3000.0f,"%.0f kg");
+        dSlider({cx+130,cy+4,210,20},"Vehicle mass",car.mass,600.0f,3800.0f,"%.0f kg");
 
         DrawText("Centre of mass offset (body space)",(int)cx,(int)cy+38,14,
                  Color{150,160,175,255});
         auto fsl=[&](Rectangle r,const char*l,float&v,float lo,float hi){
             GuiSlider(r,l,TextFormat("%+.2f m",v),&v,lo,hi); };
         fsl({cx+150,cy+62,190,18}, "Fwd/back X", com.x,-1.20f,1.20f);
-        fsl({cx+150,cy+86,190,18}, "Up/down Y",  com.y,-0.40f,0.50f);
+        fsl({cx+150,cy+86,190,18}, "Up/down Y",  com.y,-1.00f,0.50f);
         fsl({cx+150,cy+110,190,18},"Left/right Z",com.z,-0.70f,0.70f);
 
         int lx=(int)panel.x+440, ly=(int)panel.y+64;
-        DrawText(TextFormat("mass: %.0f kg",car.mass),lx,ly,15,Color{120,200,240,255});
+        DrawText(TextFormat("mass: %.0f kg  (GVM 3500)",car.mass),lx,ly,15,
+                 Color{120,200,240,255});
         DrawText("Red sphere in the 3D view = CoM.",lx,ly+26,13,Color{120,128,140,255});
         DrawText("Forward CoM -> more front grip;",lx,ly+48,13,Color{120,128,140,255});
         DrawText("lower CoM -> resists rollover.",lx,ly+64,13,Color{120,128,140,255});
@@ -514,7 +525,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
     else {
         DrawText("Preset",(int)cx,(int)cy+4,16,Color{150,160,175,255});
         int old=suspPreset;
-        GuiToggleGroup({cx+70,cy,90,26},"SPORT;COMFORT;OFFROAD",&suspPreset);
+        GuiToggleGroup({cx+70,cy,90,26},"UNLADEN;LADEN;ROUGH",&suspPreset);
         if(suspPreset!=old) susp=phys::suspPreset(suspPreset);  // apply preset
 
         auto fslider=[&](Rectangle r,const char*l,float&v,float lo,float hi,
@@ -522,7 +533,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
             GuiSlider(r,l,TextFormat(fmt,v),&v,lo,hi); };
         fslider({cx+110,cy+40,200,18},"Rest len",  susp.rest,     0.20f,0.70f,"%.2f m");
         fslider({cx+110,cy+62,200,18},"Travel",    susp.travel,   0.08f,0.45f,"%.2f m");
-        fslider({cx+110,cy+84,200,18},"Stiffness", susp.stiffness,8000.f,60000.f,"%.0f");
+        fslider({cx+110,cy+84,200,18},"Stiffness", susp.stiffness,8000.f,90000.f,"%.0f");
         fslider({cx+110,cy+106,200,18},"Damping",  susp.damping,  1000.f,9000.f,"%.0f");
         fslider({cx+110,cy+128,200,18},"Wheel R",  susp.radius,   0.25f,0.55f,"%.2f m");
 
@@ -540,7 +551,7 @@ static void DrawEditor(Rectangle panel, Vehicle& car, int& tab,
 int main(){
     int W=1180,H=720;
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
-    InitWindow(W,H,"Drivetrain Simulator  -  configurable engine | clutch | diffs | wheels");
+    InitWindow(W,H,"Ford Transit Mk7 330M RWD  -  2.2 TDCi 125PS | VMT6 6-speed | 3.73 axle");
     SetWindowMinSize(1080,680);
     SetTargetFPS(60);
     GuiSetStyle(DEFAULT,TEXT_SIZE,16);
@@ -589,25 +600,64 @@ int main(){
     }
     terrain.materials[0].shader = litShader;
 
-    int        suspPreset = phys::SUSP_SPORT;
+    int        suspPreset = phys::SUSP_UNLADEN;
     phys::Susp susp = phys::suspPreset(suspPreset);
-    Vector3    com  = {0,0,0};      // centre-of-mass offset (body space, m)
+    // CoM (body space, relative to the box centre): forward of centre for the
+    // front-mounted engine (~55/45 unladen split) and low enough to sit about
+    // 0.74 m above the road -- a rollover threshold of ~1.16 g on a 1.72 m track.
+    Vector3    com  = {0.16f,-0.45f,0.0f};
 
-    // (re)build the rigid-body car from the current wheel configuration
+    // (re)build the rigid-body car from the current wheel configuration.
+    // The Jolt WheeledVehicleController runs the engine/gearbox/diff, so we map
+    // the editable drivetrain spec (engine curve, gear ratios, final drive)
+    // onto phys::Drivetrain here.
     auto buildVeh=[&](){
         if(car.wheels.empty()) return;
-        std::vector<float> ox,oy,oz;
-        for(const Wheel& wh: car.wheels){
-            ox.push_back((float)wh.px); oy.push_back(0.0f); oz.push_back((float)wh.pz); }
         float minx=1e9f,maxx=-1e9f,minz=1e9f,maxz=-1e9f;
         for(const Wheel& wh: car.wheels){
             minx=std::min(minx,(float)wh.px); maxx=std::max(maxx,(float)wh.px);
             minz=std::min(minz,(float)wh.pz); maxz=std::max(maxz,(float)wh.pz); }
-        float blen=std::max((maxx-minx)+0.6f,1.2f);
-        float bwid=std::max((maxz-minz)+0.2f,0.8f);
+        // Transit MWB: 5.68 m long over a 3.30 m wheelbase (2.38 m of overhang),
+        // 1.97 m wide, and a 2.05 m tall box for the medium-roof load bay.
+        float blen=std::max((maxx-minx)+2.38f,1.2f);
+        float bwid=std::max((maxz-minz)+0.25f,0.8f);
+        float bhei=2.05f;
+        // the box is centred on the body origin, so the suspension tops hang
+        // 0.50 m above its underside -- that puts the wheels below the floor
+        // and leaves ~0.20 m of ground clearance.
+        float attachY=-bhei*0.5f+0.50f;
+
+        std::vector<float> ox,oy,oz;
+        std::vector<int>   driven;
+        for(const Wheel& wh: car.wheels){
+            ox.push_back((float)wh.px); oy.push_back(attachY); oz.push_back((float)wh.pz);
+            driven.push_back(wh.driven?1:0); }
+
+        phys::Drivetrain dt;
+        dt.minRPM  = (float)car.eng.idleRPM;
+        dt.maxRPM  = (float)car.eng.redline;
+        dt.inertia = (float)car.eng.I;
+        float peak = 1.0f;
+        for(const CurvePoint& cp: car.eng.curve) peak=std::max(peak,(float)cp.nm);
+        dt.maxTorque = peak;
+        dt.curveRPM.clear(); dt.curveNm.clear();
+        for(const CurvePoint& cp: car.eng.curve){
+            dt.curveRPM.push_back((float)cp.rpm); dt.curveNm.push_back((float)cp.nm); }
+        dt.gearRatios.clear();
+        for(size_t g=1; g<car.box.ratio.size(); ++g)       // skip [0]=neutral
+            dt.gearRatios.push_back((float)car.box.ratio[g]);
+        dt.finalDrive = (float)car.box.finalDrive;
+        // the tightest configured diff sets the vehicle-wide limited-slip feel;
+        // an OPEN diff (the Transit's stock rear axle) means no coupling at all
+        dt.lsdRatio = FLT_MAX;
+        for(const Differential& d : car.diffs){
+            if(d.mode==DIFF_LOCKED)   dt.lsdRatio=std::min(dt.lsdRatio,1.01f);
+            else if(d.mode==DIFF_LSD)  dt.lsdRatio=std::min(dt.lsdRatio,1.4f);
+        }
+
         world.setSusp(susp);
-        world.buildVehicle(ox,oy,oz,blen,0.7f,bwid,(float)car.mass,0.0f,spawnH,0.0f,
-                           com.x,com.y,com.z);
+        world.buildVehicle(ox,oy,oz,driven,dt,blen,bhei,bwid,(float)car.mass,
+                           0.0f,spawnH,0.0f, com.x,com.y,com.z);
         car.reset();
     };
 
@@ -672,26 +722,30 @@ int main(){
         if(running && !prevRunning) buildVeh();
         prevRunning = running;
 
-        // ---- physics: drivetrain + 3D rigid body (only while running) -----
+        // ---- physics: Jolt vehicle controller (only while running) --------
         if(running && world.hasVehicle()){
             // grip follows the terrain zone the car is currently sitting on
             float bp0[3]; world.bodyPosition(bp0);
             car.surf = surfZone(bp0[0], bp0[2]);
 
-            // feed the body state back into the drivetrain
-            car.v = world.forwardSpeed();
+            // steering keys give a normalized [-1,1] input (see below)
+            float steer01 = std::max(-1.0f, std::min(1.0f, steer/0.5f));
+            world.step(1.0f/60.0f, throttle, brake, steer01,
+                       car.box.gear, clutchEng, SURFACES[car.surf].mu);
+
+            // mirror Jolt's state back into the drivetrain struct so the gauges,
+            // audio and plots (which read car.*) keep working
+            car.v         = world.forwardSpeed();
+            car.eng.omega = world.engineRPM()*RPM2RAD;
+            car.eng.stalled = world.engineStalled();
             const auto& wo=world.wheels();
-            for(size_t i=0;i<car.wheels.size() && i<wo.size();++i)
-                car.wheels[i].Fz = wo[i].grounded ? wo[i].Fz : 0.0;
-
-            // advance the drivetrain (engine/clutch/gearbox/wheel spin -> Fx)
-            const int SUB=8; double dt=(1.0/60.0)/SUB;
-            for(int s=0;s<SUB;s++) car.step(dt,throttle,brake);
-
-            // hand each wheel's longitudinal tire force to Jolt and step it
-            std::vector<float> driveN(car.wheels.size());
-            for(size_t i=0;i<car.wheels.size();++i) driveN[i]=(float)car.wheels[i].Fx;
-            world.step(1.0f/60.0f, driveN, brake, steer, SURFACES[car.surf].mu);
+            for(size_t i=0;i<car.wheels.size() && i<wo.size();++i){
+                car.wheels[i].Fz    = wo[i].grounded ? wo[i].Fz : 0.0;
+                car.wheels[i].Fx    = wo[i].Fx;
+                car.wheels[i].kappa = wo[i].slip;
+                car.wheels[i].angle = wo[i].spin;
+                car.wheels[i].omega = wo[i].omega;
+            }
 
             // fell off the terrain? respawn at the centre pad
             float bp[3]; world.bodyPosition(bp);
@@ -820,16 +874,16 @@ int main(){
         // --- small gauges in the bottom corners of the 3D view -------------
         float gR=std::min(70.0f, scene.width*0.075f);
         DrawGauge({scene.x+gR+14, scene.y+scene.height-gR-14}, gR,
-                  rpm,7000,"RPM x1000",TextFormat("%.1f",rpm/1000.0),
-                  car.eng.redline/7000.0);
+                  rpm,5000,"RPM x1000",TextFormat("%.1f",rpm/1000.0),
+                  car.eng.redline/5000.0);
         DrawGauge({scene.x+scene.width-gR-14, scene.y+scene.height-gR-14}, gR,
-                  std::fabs(kmh),220,"km/h",TextFormat("%.0f",std::fabs(kmh)),1.0);
+                  std::fabs(kmh),180,"km/h",TextFormat("%.0f",std::fabs(kmh)),1.0);
 
         // --- lower area: plots while running, editor while stopped ---------
         if(running){
             float pw=(lower.width-20)*0.5f, ph=(lower.height-14)*0.5f, py=lower.y;
-            DrawPlot({lower.x,py,pw,ph},pRPM,0,7000,Color{240,200,90,255},"engine rpm");
-            DrawPlot({lower.x,py,pw,ph},pWheel,0,7000,Color{120,200,240,255},
+            DrawPlot({lower.x,py,pw,ph},pRPM,0,5000,Color{240,200,90,255},"engine rpm");
+            DrawPlot({lower.x,py,pw,ph},pWheel,0,5000,Color{120,200,240,255},
                      "wheel-equiv rpm",NAN);
             DrawText("engine vs wheel-equiv rpm (gap = clutch slip)",
                      (int)lower.x+6,(int)(py+ph-18),12,Color{120,128,140,255});

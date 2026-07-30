@@ -77,3 +77,17 @@ if(APPLE)
     target_link_libraries(tanksim PRIVATE
         "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
 endif()
+
+# ---- van simulator (fourth executable) -------------------------------------
+# Same Transit model as carsim, but the drivetrain is ours end to end: Jolt only
+# supplies the chassis rigid body, the suspension raycasts and the collision.
+add_executable(vansim van_main.cpp sim.cpp physics.cpp)
+target_include_directories(vansim PRIVATE ${raygui_SOURCE_DIR}/src)
+target_link_libraries(vansim PRIVATE raylib Jolt)
+add_custom_command(TARGET vansim POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/idle.ogg $<TARGET_FILE_DIR:vansim>/idle.ogg)
+if(APPLE)
+    target_link_libraries(vansim PRIVATE
+        "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
+endif()

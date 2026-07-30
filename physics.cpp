@@ -20,10 +20,15 @@
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
+#include <Jolt/Physics/Body/Body.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyLock.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
+#include <Jolt/Physics/Vehicle/VehicleConstraint.h>
+#include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
+#include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
 
 #include <thread>
 #include <algorithm>
@@ -84,20 +89,22 @@ public:
 namespace phys {
 
 // ----------------------------- presets --------------------------------------
+// Ford Transit Mk7 330M load states.  Fields:
+//   rest, travel, stiffness, damping, radius, gripK
 Susp suspPreset(int which){
     Susp s;
     switch(which){
-        case SUSP_COMFORT: s={0.46f,0.26f,22000.f,4200.f,0.42f,12000.f}; break;
-        case SUSP_OFFROAD: s={0.55f,0.40f,26000.f,4600.f,0.46f,13000.f}; break;
-        case SUSP_SPORT:
-        default:           s={0.36f,0.16f,40000.f,5200.f,0.40f,20000.f}; break;
+        case SUSP_LADEN:   s={0.45f,0.24f,62000.f,7200.f,0.345f,30000.f}; break;
+        case SUSP_ROUGH:   s={0.52f,0.32f,38000.f,5200.f,0.345f,20000.f}; break;
+        case SUSP_UNLADEN:
+        default:           s={0.45f,0.20f,45000.f,5600.f,0.345f,24000.f}; break;
     }
     return s;
 }
 const char* suspPresetName(int which){
-    switch(which){ case SUSP_COMFORT: return "COMFORT";
-                   case SUSP_OFFROAD: return "OFFROAD";
-                   default:           return "SPORT"; }
+    switch(which){ case SUSP_LADEN: return "LADEN";
+                   case SUSP_ROUGH: return "ROUGH";
+                   default:         return "UNLADEN"; }
 }
 
 // ----------------------------- pimpl ----------------------------------------
@@ -129,11 +136,25 @@ struct World::Impl {
     float bodyLen=4, bodyHei=0.8f, bodyWid=1.8f, mass=1300;
     Susp susp;
 
+    // Jolt vehicle (car mode): constraint owns wheels + WheeledVehicleController
+    Ref<VehicleConstraint>     vehicle;
+    Ref<VehicleCollisionTester> tester;
+    std::vector<float>         spin;      // per-wheel accumulated rolling angle
+    bool                       isCar = false;
+
+    // stall model (Jolt's engine clamps at mMinRPM and can never die)
+    std::vector<int> drivenIdx;      // wheels fed by the differentials
+    float finalDrive = 3.73f;        // differential ratio
+    float stallRPM   = 400.0f;       // engine dies below this
+    bool  stalled    = false;
+    float stallT     = 0.0f;         // how long we've been below stall speed [s]
+
     // tank track state
     std::vector<char> trackSide;   // per ray: 0 = left track, 1 = right track
     TrackSusp         tsusp;
     TrackOut          tout[2];     // per-track aggregate readback (0=L,1=R)
     bool              isTank = false;
+    bool              isRig  = false;  // custom raycast car (no Jolt controller)
 };
 
 World::World() {
@@ -150,6 +171,11 @@ World::World() {
 
 World::~World() {
     BodyInterface& bi = p_->sys.GetBodyInterface();
+    if(p_->vehicle!=nullptr){
+        p_->sys.RemoveStepListener(p_->vehicle);
+        p_->sys.RemoveConstraint(p_->vehicle);
+        p_->vehicle=nullptr;
+    }
     for(BodyID id : p_->obsId){ bi.RemoveBody(id); bi.DestroyBody(id); }
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis); }
     if(!p_->ground.IsInvalid()){ bi.RemoveBody(p_->ground); bi.DestroyBody(p_->ground); }
@@ -191,18 +217,27 @@ float World::heightSample(int i,int j) const {
 void World::buildVehicle(const std::vector<float>& offX,
                          const std::vector<float>& offY,
                          const std::vector<float>& offZ,
+                         const std::vector<int>&   driven,
+                         const Drivetrain& dt,
                          float bodyLen,float bodyHei,float bodyWid,float mass,
                          float spawnX,float spawnY,float spawnZ,
                          float comX,float comY,float comZ){
     BodyInterface& bi = p_->sys.GetBodyInterface();
+    // tear down any previous vehicle constraint before its body goes away
+    if(p_->vehicle!=nullptr){
+        p_->sys.RemoveStepListener(p_->vehicle);
+        p_->sys.RemoveConstraint(p_->vehicle);
+        p_->vehicle=nullptr;
+    }
     if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis);
                          p_->haveChassis=false; }
 
+    size_t nW = offX.size();
     p_->ox=offX; p_->oy=offY; p_->oz=offZ;
-    p_->brakeAnchor.assign(offX.size(), Vec3::sZero());
-    p_->brakeStuck.assign(offX.size(), 0);
+    p_->spin.assign(nW, 0.0f);
     p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
-    wout_.assign(offX.size(), WheelOut{});
+    p_->isCar = true;
+    wout_.assign(nW, WheelOut{});
 
     // box chassis, wrapped so its centre of mass can be shifted (body space)
     BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
@@ -220,6 +255,120 @@ void World::buildVehicle(const std::vector<float>& offX,
     p_->chassis = b->GetID();
     bi.AddBody(p_->chassis, EActivation::Activate);
     p_->haveChassis = true;
+
+    // ---- assemble the Jolt vehicle constraint ------------------------------
+    const Susp& s = p_->susp;
+    // convert the physical spring (k [N/m], c [N s/m]) into Jolt's
+    // frequency+damping-ratio form using a per-corner sprung mass so the
+    // SPORT/COMFORT/OFFROAD presets keep meaning.
+    float cornerM = std::max(1.0f, mass / std::max<size_t>(1,nW));
+    float wn      = std::sqrt(std::max(1.0f, s.stiffness) / cornerM);   // rad/s
+    float freq    = std::max(0.6f, std::min(4.0f, wn/(2.0f*JPH_PI)));   // Hz
+    float zeta    = s.damping / (2.0f*std::sqrt(std::max(1.0f,s.stiffness)*cornerM));
+    zeta          = std::max(0.1f, std::min(1.2f, zeta));
+
+    VehicleConstraintSettings vs;
+    vs.mUp      = Vec3(0,1,0);
+    vs.mForward = Vec3(1,0,0);          // our body convention: +X forward
+    vs.mMaxPitchRollAngle = DegreesToRadians(60.0f);
+
+    const float MAX_STEER = DegreesToRadians(36.0f);   // ~11.7 m turning circle
+    for(size_t i=0;i<nW;++i){
+        WheelSettingsWV* w = new WheelSettingsWV();
+        // attach point: offY is the suspension top; drop by the rest length so
+        // the wheel sits where the old raycast model put it.
+        w->mPosition            = Vec3(offX[i], offY[i], offZ[i]);
+        w->mSuspensionDirection = Vec3(0,-1,0);
+        w->mSteeringAxis        = Vec3(0,1,0);
+        w->mWheelUp             = Vec3(0,1,0);
+        w->mWheelForward        = Vec3(1,0,0);
+        w->mRadius              = s.radius;
+        w->mWidth               = 0.235f;              // 235-section van tyre
+        w->mSuspensionMinLength = std::max(0.0f, s.rest - s.travel);
+        w->mSuspensionMaxLength = s.rest;
+        w->mSuspensionSpring    = SpringSettings(ESpringMode::FrequencyAndDamping,
+                                                 freq, zeta);
+        // front wheels (ahead of the COM) steer; rears don't
+        w->mMaxSteerAngle   = (offX[i] > 0.01f) ? MAX_STEER : 0.0f;
+        // front-biased braking, no ABS; handbrake acts on the rear axle only
+        w->mMaxBrakeTorque  = (offX[i] > 0.01f) ? 3500.0f : 2500.0f;
+        w->mMaxHandBrakeTorque = (offX[i] > 0.01f) ? 0.0f : 5000.0f;
+        vs.mWheels.push_back(w);
+    }
+
+    WheeledVehicleControllerSettings* ctl = new WheeledVehicleControllerSettings();
+
+    // engine curve (normalized: X = rpm fraction of maxRPM, Y = fraction of maxTorque)
+    ctl->mEngine.mMaxTorque = std::max(1.0f, dt.maxTorque);
+    ctl->mEngine.mMinRPM    = std::max(10.0f, dt.minRPM);
+    ctl->mEngine.mMaxRPM    = std::max(dt.minRPM+100.0f, dt.maxRPM);
+    ctl->mEngine.mInertia   = std::max(0.05f, dt.inertia);
+    ctl->mEngine.mNormalizedTorque.Clear();
+    if(dt.curveRPM.size()>=2 && dt.curveRPM.size()==dt.curveNm.size()){
+        for(size_t i=0;i<dt.curveRPM.size();++i){
+            float x = dt.curveRPM[i]/ctl->mEngine.mMaxRPM;
+            float y = dt.curveNm[i] /ctl->mEngine.mMaxTorque;
+            ctl->mEngine.mNormalizedTorque.AddPoint(std::max(0.0f,std::min(1.0f,x)),
+                                                    std::max(0.0f,y));
+        }
+        ctl->mEngine.mNormalizedTorque.Sort();
+    } else {
+        ctl->mEngine.mNormalizedTorque.AddPoint(0.0f,0.8f);
+        ctl->mEngine.mNormalizedTorque.AddPoint(0.7f,1.0f);
+        ctl->mEngine.mNormalizedTorque.AddPoint(1.0f,0.8f);
+    }
+
+    // transmission: manual (the UI shifts); gears from the editable ratios
+    ctl->mTransmission.mMode = ETransmissionMode::Manual;
+    ctl->mTransmission.mGearRatios.clear();
+    if(dt.gearRatios.empty()) ctl->mTransmission.mGearRatios.push_back(4.21f);
+    else for(float g : dt.gearRatios) ctl->mTransmission.mGearRatios.push_back(g);
+    ctl->mTransmission.mReverseGearRatios.clear();
+    ctl->mTransmission.mReverseGearRatios.push_back(-std::fabs(dt.reverseRatio));
+    // heavy single dry plate: takes a moment to bite, holds a lot of torque
+    ctl->mTransmission.mClutchStrength = std::max(1.0f, dt.clutchStrength);
+    ctl->mTransmission.mSwitchTime     = std::max(0.05f, dt.shiftTime);
+    ctl->mTransmission.mClutchReleaseTime = std::max(0.05f, dt.shiftTime*0.8f);
+    // diesel shift points (only consulted if the mode is switched to Auto)
+    ctl->mTransmission.mShiftUpRPM   = 2800.0f;
+    ctl->mTransmission.mShiftDownRPM = 1500.0f;
+
+    // one differential per adjacent pair of driven wheels; the final drive is
+    // folded into the differential ratio.
+    std::vector<int> dv;
+    for(size_t i=0;i<nW;++i) if(i<driven.size() && driven[i]) dv.push_back((int)i);
+    if(dv.empty() && nW>0) dv.push_back((int)nW-1);   // always drive something
+    ctl->mDifferentials.clear();
+    for(size_t i=0;i<dv.size();i+=2){
+        VehicleDifferentialSettings d;
+        d.mLeftWheel  = dv[i];
+        d.mRightWheel = (i+1<dv.size()) ? dv[i+1] : -1;
+        d.mDifferentialRatio = std::max(0.1f, dt.finalDrive);
+        // FLT_MAX = fully open (the Transit's stock rear axle)
+        d.mLimitedSlipRatio  = dt.lsdRatio >= FLT_MAX*0.5f
+                                 ? FLT_MAX : std::max(1.01f, dt.lsdRatio);
+        ctl->mDifferentials.push_back(d);
+    }
+    // split engine torque evenly across the differentials
+    float share = ctl->mDifferentials.empty()? 1.0f
+                    : 1.0f/(float)ctl->mDifferentials.size();
+    for(VehicleDifferentialSettings& d : ctl->mDifferentials) d.mEngineTorqueRatio=share;
+
+    // remember what the stall model needs: which wheels the engine can be
+    // dragged down by, and the reduction between them and the crankshaft
+    p_->drivenIdx  = dv;
+    p_->finalDrive = std::max(0.1f, dt.finalDrive);
+    p_->stallRPM   = std::max(0.0f, dt.stallRPM);
+    p_->stalled    = false;
+    p_->stallT     = 0.0f;
+
+    vs.mController = ctl;
+
+    p_->vehicle = new VehicleConstraint(*b, vs);
+    p_->tester  = new VehicleCollisionTesterCastCylinder(Layers::MOVING, 0.05f);
+    p_->vehicle->SetVehicleCollisionTester(p_->tester);
+    p_->sys.AddConstraint(p_->vehicle);
+    p_->sys.AddStepListener(p_->vehicle);
 }
 bool World::hasVehicle() const { return p_->haveChassis; }
 void World::setSusp(const Susp& s){ p_->susp=s; }
@@ -231,7 +380,171 @@ void World::resetVehicle(float x,float y,float z){
                               EActivation::Activate);
     bi.SetLinearVelocity (p_->chassis, Vec3::sZero());
     bi.SetAngularVelocity(p_->chassis, Vec3::sZero());
+    p_->stalled = false;
+    p_->stallT  = 0.0f;
     std::fill(p_->brakeStuck.begin(), p_->brakeStuck.end(), (char)0);
+}
+
+// ----------------------------- raycast car rig ------------------------------
+// Jolt owns the chassis body, the suspension raycasts and the collision.  It
+// does NOT own the drivetrain: no VehicleConstraint, no controller, no engine.
+// The caller integrates its own engine/clutch/gearbox/diff and hands us the
+// longitudinal tyre force each wheel is making.
+void World::buildRig(const std::vector<float>& offX,
+                     const std::vector<float>& offY,
+                     const std::vector<float>& offZ,
+                     float bodyLen,float bodyHei,float bodyWid,float mass,
+                     float spawnX,float spawnY,float spawnZ,
+                     float comX,float comY,float comZ){
+    BodyInterface& bi = p_->sys.GetBodyInterface();
+    // tear down anything that was there before
+    if(p_->vehicle!=nullptr){
+        p_->sys.RemoveStepListener(p_->vehicle);
+        p_->sys.RemoveConstraint(p_->vehicle);
+        p_->vehicle=nullptr;
+    }
+    if(p_->haveChassis){ bi.RemoveBody(p_->chassis); bi.DestroyBody(p_->chassis);
+                         p_->haveChassis=false; }
+
+    size_t nW = offX.size();
+    p_->ox=offX; p_->oy=offY; p_->oz=offZ;
+    p_->spin.assign(nW, 0.0f);
+    p_->brakeAnchor.assign(nW, Vec3::sZero());
+    p_->brakeStuck.assign(nW, 0);
+    p_->bodyLen=bodyLen; p_->bodyHei=bodyHei; p_->bodyWid=bodyWid; p_->mass=mass;
+    p_->isCar = false; p_->isTank = false; p_->isRig = true;
+    wout_.assign(nW, WheelOut{});
+
+    // box chassis, wrapped so its centre of mass can be shifted (body space)
+    BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
+    ShapeRefC boxShape = boxS.Create().Get();
+    OffsetCenterOfMassShapeSettings comS(Vec3(comX,comY,comZ), boxShape);
+    ShapeSettings::ShapeResult res = comS.Create();
+    BodyCreationSettings bcs(res.Get(),
+        RVec3(spawnX,spawnY,spawnZ), Quat::sIdentity(),
+        EMotionType::Dynamic, Layers::MOVING);
+    bcs.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
+    bcs.mMassPropertiesOverride.mMass = mass;
+    bcs.mLinearDamping  = 0.02f;
+    bcs.mAngularDamping = 0.15f;
+    bcs.mMotionQuality  = EMotionQuality::LinearCast;   // don't tunnel terrain
+    Body* b = bi.CreateBody(bcs);
+    p_->chassis = b->GetID();
+    bi.AddBody(p_->chassis, EActivation::Activate);
+    p_->haveChassis = true;
+}
+
+void World::stepRig(float dt, const std::vector<RigWheelIn>& in, float mu){
+    if(p_->haveChassis){
+        BodyInterface& bi = p_->sys.GetBodyInterface();
+        RVec3 bp = bi.GetPosition(p_->chassis);
+        Quat  bq = bi.GetRotation(p_->chassis);
+        Vec3  up    = bq*Vec3(0,1,0);
+        Vec3  fwd   = bq*Vec3(1,0,0);
+        Vec3  right = bq*Vec3(0,0,1);
+
+        const Susp& s = p_->susp;
+        float rayLen = s.rest + s.radius;
+        GroundOnlyLayerFilter& gf = p_->groundFilter;
+        bool anyForce = false;
+
+        for(size_t i=0;i<p_->ox.size();++i){
+            RigWheelIn wi = (i<in.size()) ? in[i] : RigWheelIn{};
+            // the wheel's own axes: heading swings with the steer angle
+            float cs=std::cos(wi.steer), sn=std::sin(wi.steer);
+            Vec3 wFwd   = fwd*cs + right*sn;
+            Vec3 wRight = right*cs - fwd*sn;
+
+            Vec3 local(p_->ox[i], p_->oy[i], p_->oz[i]);
+            RVec3 attach = bp + bq*local;
+            Vec3  down   = -up;
+
+            RRayCast ray{ attach, down*rayLen };
+            RayCastResult hit;
+            bool grounded = p_->sys.GetNarrowPhaseQuery().CastRay(
+                                ray, hit, BroadPhaseLayerFilter(), gf);
+
+            WheelOut wo{};
+            wo.steer = wi.steer;
+            if(grounded){
+                float d       = hit.mFraction*rayLen;
+                float suspLen = std::max(0.0f, d - s.radius);
+                float compression = std::max(0.0f, s.rest - suspLen);
+                Vec3  contact = Vec3(attach) + down*d;
+                Vec3  centre  = Vec3(attach) + down*(d - s.radius);
+
+                // The load has to act along the GROUND normal, not along the
+                // body's up axis.  With an offset centre of mass the van settles
+                // slightly nose-down, and a body-aligned spring then tilts the
+                // whole ~23 kN of support backwards with it -- a couple of
+                // hundred newtons of thrust that crept the van backwards in
+                // neutral, where free-rolling wheels leave nothing to resist it.
+                Vec3 normal = up;
+                {
+                    BodyLockRead lock(p_->sys.GetBodyLockInterface(), hit.mBodyID);
+                    if(lock.Succeeded())
+                        normal = lock.GetBody().GetWorldSpaceSurfaceNormal(
+                                     hit.mSubShapeID2, RVec3(contact));
+                }
+                if(normal.LengthSq() < 1.0e-6f) normal = up;
+                else {
+                    normal = normal.Normalized();
+                    if(normal.Dot(up) < 0.0f) normal = -normal;
+                }
+
+                Vec3  vAtt  = bi.GetPointVelocity(p_->chassis, RVec3(attach));
+                float upVel = vAtt.Dot(normal);
+
+                // spring + damper, with a stiff bump stop past full travel
+                float springTravel = std::min(compression, s.travel);
+                float Fspring = s.stiffness*springTravel;
+                float excess  = compression - s.travel;
+                if(excess > 0.0f) Fspring += s.stiffness*8.0f*excess;   // bottoming out
+                float Fdamp   = -s.damping*upVel;
+                float Fz = std::max(0.0f, Fspring + Fdamp);
+                bi.AddForce(p_->chassis, normal*Fz, RVec3(attach));
+
+                // ground velocity at the contact, resolved in the wheel's axes
+                Vec3  vCon = bi.GetPointVelocity(p_->chassis, RVec3(contact));
+                float vx = vCon.Dot(wFwd);
+                float vy = vCon.Dot(wRight);
+
+                // friction circle: the drivetrain's longitudinal force gets
+                // first claim, lateral grip takes whatever budget is left
+                float cap = std::max(0.0f, mu*Fz);
+                float Fx  = std::max(-cap, std::min(cap, wi.Fx));
+                float latBudget = std::sqrt(std::max(0.0f, cap*cap - Fx*Fx));
+                float Flat = -s.gripK*vy;
+                Flat = std::max(-latBudget, std::min(latBudget, Flat));
+
+                bi.AddForce(p_->chassis, wFwd*Fx + wRight*Flat, RVec3(contact));
+                anyForce = true;
+
+                wo.grounded=1; wo.Fz=Fz; wo.Fx=Fx; wo.vx=vx; wo.vy=vy;
+                wo.compress = std::max(0.0f, std::min(1.0f,
+                                compression/std::max(0.01f,s.travel)));
+                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
+            } else {
+                // airborne: hang the wheel at full droop, no forces
+                Vec3 centre = Vec3(attach) + down*s.rest;
+                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
+            }
+            wout_[i]=wo;
+        }
+        if(anyForce) bi.ActivateBody(p_->chassis);
+    }
+
+    p_->sys.Update(dt, 2, p_->temp, p_->jobs);
+
+    // refresh dynamic obstacle (crate) transforms for rendering
+    BodyInterface& bi2 = p_->sys.GetBodyInterface();
+    for(size_t i=0;i<p_->obsId.size();++i){
+        if(!obs_[i].dynamic) continue;
+        RVec3 p = bi2.GetPosition(p_->obsId[i]);
+        Quat  q = bi2.GetRotation(p_->obsId[i]);
+        obs_[i].px=p.GetX(); obs_[i].py=p.GetY(); obs_[i].pz=p.GetZ();
+        obs_[i].qx=q.GetX(); obs_[i].qy=q.GetY(); obs_[i].qz=q.GetZ(); obs_[i].qw=q.GetW();
+    }
 }
 
 // ----------------------------- tank -----------------------------------------
@@ -443,101 +756,93 @@ void World::resetObstacles(){
     }
 }
 
-void World::step(float dt, const std::vector<float>& driveN,
-                 float brake, float steerRad, float mu){
-    if(p_->haveChassis){
+void World::step(float dt, float throttle, float brake, float steer,
+                 int gear, float clutch, float mu){
+    if(p_->haveChassis && p_->vehicle!=nullptr){
         BodyInterface& bi = p_->sys.GetBodyInterface();
-        RVec3 bp = bi.GetPosition(p_->chassis);     // shape origin (box centre)
-        Quat  bq = bi.GetRotation(p_->chassis);
-        Vec3  up    = bq*Vec3(0,1,0);
-        Vec3  fwd   = bq*Vec3(1,0,0);
-        Vec3  right = bq*Vec3(0,0,1);
+        WheeledVehicleController* c =
+            static_cast<WheeledVehicleController*>(p_->vehicle->GetController());
 
-        const Susp& s = p_->susp;
-        float rayLen = s.rest + s.radius;
-        GroundOnlyLayerFilter& gf = p_->groundFilter;
+        // surface grip: Jolt combines the wheel-friction curve with the ground
+        // body's friction, so we steer grip through the ground contact.
+        if(!p_->ground.IsInvalid()) bi.SetFriction(p_->ground, std::max(0.02f,mu));
 
-        for(size_t i=0;i<p_->ox.size();++i){
-            Vec3 local(p_->ox[i], p_->oy[i], p_->oz[i]);
-            RVec3 attach = bp + bq*local;
-            Vec3  down   = -up;
+        float fwd    = std::max(0.0f, std::min(1.0f, throttle));
+        float rt     = std::max(-1.0f, std::min(1.0f, steer));
+        float br     = std::max(0.0f, std::min(1.0f, brake));
+        float cl     = std::max(0.0f, std::min(1.0f, clutch));
 
-            RRayCast ray{ attach, down*rayLen };
-            RayCastResult hit;
-            bool grounded = p_->sys.GetNarrowPhaseQuery().CastRay(
-                                ray, hit, BroadPhaseLayerFilter(), gf);
-
-            WheelOut wo{};
-            if(grounded){
-                float d = hit.mFraction*rayLen;          // attach -> ground
-                float suspLen = std::max(0.0f, d - s.radius);
-                float compression = s.rest - suspLen;     // + = compressed
-                // wheel centre sits one radius above the ground hit
-                Vec3 contact = Vec3(attach) + down*d;
-                Vec3 centre  = Vec3(attach) + down*(d - s.radius);
-
-                Vec3 vAtt = bi.GetPointVelocity(p_->chassis, RVec3(attach));
-                float upVel = vAtt.Dot(up);
-                float Fspring = s.stiffness*compression;
-                float Fdamp   = -s.damping*upVel;
-                float Fz = std::max(0.0f, Fspring + Fdamp);
-
-                bi.AddForce(p_->chassis, up*Fz, RVec3(attach));
-
-                // steer the front wheels (offX>0) by rotating the tyre basis
-                Vec3 wf=fwd, wr=right;
-                if(p_->ox[i]>0.01f && std::fabs(steerRad)>1e-4f){
-                    float c=std::cos(steerRad), sn=std::sin(steerRad);
-                    wf = fwd*c + right*sn;
-                    wr = right*c - fwd*sn;
+        // ---- stall model ---------------------------------------------------
+        // Jolt's engine is clamped to mMinRPM, so on its own it would sit at
+        // idle forever and keep shoving torque through an engaged clutch --
+        // the wheels fight the brakes instead of the engine dying.  With the
+        // clutch out the driveline dictates crank speed, so work out what rpm
+        // the wheels are asking for and kill the engine if the brakes drag it
+        // below the stall threshold.
+        bool inGear = (gear != 0);
+        if(!inGear || cl < 0.15f){          // clutch in or neutral -> it restarts
+            p_->stalled = false;
+            p_->stallT  = 0.0f;
+        } else if(!p_->stalled){
+            float ratio = std::fabs(c->GetTransmission().GetCurrentRatio())
+                          * p_->finalDrive;
+            float wOmega = 0.0f;  int n = 0;
+            for(int wi : p_->drivenIdx){
+                if(wi>=0 && wi<(int)p_->vehicle->GetWheels().size()){
+                    wOmega += std::fabs(p_->vehicle->GetWheel(wi)->GetAngularVelocity());
+                    n++;
                 }
-
-                // longitudinal tyre force from the drivetrain
-                float drive = i<driveN.size()? driveN[i] : 0.0f;
-                bi.AddForce(p_->chassis, wf*drive, RVec3(contact));
-
-                // lateral grip opposes sideways slip, capped by mu*Fz
-                float vlat = vAtt.Dot(wr);
-                float Flat = -s.gripK*vlat;
-                float cap  = mu*Fz;
-                Flat = std::max(-cap, std::min(cap, Flat));
-                bi.AddForce(p_->chassis, wr*Flat, RVec3(contact));
-
-                // brake: a static-friction hold along the wheel-forward axis.
-                // We anchor the contact point and pull it back with a PD force
-                // (spring+damper) so a stopped car HOLDS on a slope instead of
-                // creeping down it.  The force is capped by the available grip
-                // (mu*Fz); once exceeded the anchor slides and the tyre skids.
-                if(brake>0.001f){
-                    float vfwd = vAtt.Dot(wf);
-                    if(!p_->brakeStuck[i]){ p_->brakeAnchor[i]=contact;
-                                            p_->brakeStuck[i]=1; }
-                    float xlong = (contact - p_->brakeAnchor[i]).Dot(wf);
-                    float Fb  = -(s.stiffness*xlong + s.damping*vfwd)*brake;
-                    float cap = mu*Fz;
-                    if(std::fabs(Fb) > cap){              // grip lost -> skid
-                        Fb = Fb>0 ? cap : -cap;
-                        p_->brakeAnchor[i]=contact;       // let the anchor slide
-                    }
-                    bi.AddForce(p_->chassis, wf*Fb, RVec3(contact));
-                } else {
-                    p_->brakeStuck[i]=0;
-                }
-
-                wo.grounded=1; wo.Fz=Fz;
-                wo.compress = std::max(0.0f,std::min(1.0f, compression/std::max(0.01f,s.travel)));
-                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
-            } else {
-                p_->brakeStuck[i]=0;                  // airborne -> no static hold
-                Vec3 centre = Vec3(attach) + down*s.rest;
-                wo.grounded=0; wo.Fz=0; wo.compress=0;
-                wo.x=centre.GetX(); wo.y=centre.GetY(); wo.z=centre.GetZ();
             }
-            if(i<wout_.size()) wout_[i]=wo;
+            if(n>0) wOmega /= (float)n;
+            float rpmDemand = wOmega*ratio*60.0f/(2.0f*JPH_PI);
+            // only a nearly-engaged clutch can drag the crank down; slipping it
+            // (a normal launch) leaves the engine free to rev.
+            bool dragged = cl > 0.85f && rpmDemand < p_->stallRPM && br > 0.15f;
+            p_->stallT = dragged ? p_->stallT + dt : 0.0f;
+            if(p_->stallT > 0.15f) p_->stalled = true;
         }
+
+        if(p_->stalled){
+            // dead engine: no combustion torque, and the locked driveline holds
+            // the vehicle exactly where it stopped.
+            fwd = 0.0f;
+            br  = 1.0f;
+            cl  = 0.0f;      // nothing gets through to the wheels
+        }
+
+        c->SetDriverInput(fwd, rt, br, 0.0f);
+        c->GetTransmission().Set(gear, cl);
+
+        // keep the chassis awake whenever the driver is asking for something
+        if(fwd>0.01f || br>0.01f || std::fabs(rt)>0.01f)
+            bi.ActivateBody(p_->chassis);
     }
 
     p_->sys.Update(dt, 2, p_->temp, p_->jobs);
+
+    // read the Jolt wheels back into WheelOut for rendering / telemetry
+    if(p_->haveChassis && p_->vehicle!=nullptr){
+        const Susp& s = p_->susp;
+        float travel  = std::max(0.01f, s.travel);
+        float invDt   = 1.0f/std::max(1e-4f,dt);
+        for(uint i=0;i<(uint)p_->ox.size() && i<wout_.size();++i){
+            const WheelWV* w = static_cast<const WheelWV*>(p_->vehicle->GetWheel(i));
+            RMat44 wt = p_->vehicle->GetWheelWorldTransform(i, Vec3(0,0,1), Vec3(0,1,0));
+            RVec3 cw = wt.GetTranslation();
+            WheelOut wo{};
+            wo.x=(float)cw.GetX(); wo.y=(float)cw.GetY(); wo.z=(float)cw.GetZ();
+            wo.grounded = w->HasContact() ? 1 : 0;
+            wo.Fz       = w->GetSuspensionLambda()  * invDt;   // impulse -> force
+            wo.Fx       = w->GetLongitudinalLambda()* invDt;
+            wo.compress = std::max(0.0f, std::min(1.0f,
+                            (s.rest - w->GetSuspensionLength())/travel));
+            wo.steer    = w->GetSteerAngle();
+            wo.spin     = w->GetRotationAngle();
+            wo.slip     = w->mLongitudinalSlip;
+            wo.omega    = w->GetAngularVelocity();
+            wout_[i]=wo;
+        }
+    }
 
     // refresh dynamic obstacle (crate) transforms for rendering
     BodyInterface& bi2 = p_->sys.GetBodyInterface();
@@ -568,6 +873,20 @@ float World::forwardSpeed() const {
     Vec3 v = bi.GetLinearVelocity(p_->chassis);
     Vec3 fwd = bi.GetRotation(p_->chassis)*Vec3(1,0,0);
     return v.Dot(fwd);
+}
+float World::engineRPM() const {
+    if(p_->vehicle==nullptr) return 0.0f;
+    if(p_->stalled) return 0.0f;                  // dead engine, no crank speed
+    const WheeledVehicleController* c =
+        static_cast<const WheeledVehicleController*>(p_->vehicle->GetController());
+    return c->GetEngine().GetCurrentRPM();
+}
+bool World::engineStalled() const { return p_->stalled; }
+int World::currentGear() const {
+    if(p_->vehicle==nullptr) return 0;
+    const WheeledVehicleController* c =
+        static_cast<const WheeledVehicleController*>(p_->vehicle->GetController());
+    return c->GetTransmission().GetCurrentGear();
 }
 
 } // namespace phys

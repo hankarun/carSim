@@ -24,18 +24,21 @@ extern const double RPM2RAD;
 // ----------------------------- engine ---------------------------------------
 struct CurvePoint { double rpm, nm; };
 
+// Ford Transit Mk7 2.2 TDCi Duratorq, 125 PS (92 kW @ 3500 rpm), 350 Nm
+// @ 1450-2000 rpm.  Diesel: heavy dual-mass flywheel, low idle, 4300 rpm cut.
 struct Engine {
-    double I       = 0.22;      // flywheel inertia [kg m^2]
+    double I       = 0.35;      // flywheel inertia [kg m^2] (dual-mass)
     double omega   = 84.0;      // [rad/s]  (~800 rpm idle)
     double idleRPM = 800.0;
-    double redline = 6500.0;
-    double stallRPM= 350.0;
+    double redline = 4300.0;    // fuel cut / governor
+    double stallRPM= 400.0;
     bool   stalled = false;     // engine has died (dragged below stall under load)
 
-    // wide-open-throttle torque curve, kept sorted by rpm (editable)
+    // wide-open-throttle torque curve, kept sorted by rpm (editable).
+    // Flat 350 Nm shelf from 1450-2000 rpm, 92 kW peak at 3500 rpm.
     std::vector<CurvePoint> curve{
-        {800,150},{1500,200},{2500,235},{3500,250},
-        {4500,248},{5500,225},{6200,195},{6500,175} };
+        {800,180},{1200,280},{1450,350},{2000,350},{2500,320},
+        {3000,285},{3500,250},{4000,200},{4300,150} };
 
     void   sortCurve();                 // keep points monotonic in rpm
     double torqueAt(double rpm) const;  // interpolate the curve
@@ -46,11 +49,13 @@ struct Engine {
 // Soft-locking multi-plate friction clutch: each plate adds capacity; a tanh
 // smoothly "locks" the pack as the speed difference -> 0 (no chatter).
 struct Clutch {
-    double capacityPerPlate = 235.0; // torque capacity of one friction plate [Nm]
-    int    plates     = 2;           // number of clutch plates (the "clutch count")
+    // Transit: a single heavy dry plate rated ~1.3x the engine's peak torque.
+    double capacityPerPlate = 460.0; // torque capacity of one friction plate [Nm]
+    int    plates     = 1;           // number of clutch plates (the "clutch count")
     double engagement = 1.0;         // 0 = pedal in (open), 1 = fully engaged
-    double band       = 6.0;         // slip-speed scale for the soft lock [rad/s]
+    double band       = 5.0;         // slip-speed scale for the soft lock [rad/s]
     bool   lockedish  = false;       // display flag
+    bool   locked     = false;       // surfaces gripped: engine + driveline rigid
 
     double capacity() const { return capacityPerPlate * (double)plates; }
     double torque(double dOmega) const;
@@ -58,10 +63,11 @@ struct Clutch {
 
 // ----------------------------- gearbox --------------------------------------
 struct Gearbox {
-    // index 0 = neutral. ratios for 1st..3rd.
-    std::vector<double> ratio{ 0.0, 3.20, 1.90, 1.30 };  // [0]=neutral, then gears
-    double finalDrive = 3.90;
-    double eff        = 0.90;     // driveline efficiency
+    // Ford VMT6 six-speed manual: direct 4th plus two overdrives.
+    // index 0 = neutral, then 1st..6th.
+    std::vector<double> ratio{ 0.0, 4.21, 2.37, 1.46, 1.00, 0.78, 0.66 };
+    double finalDrive = 3.73;     // rear axle crown/pinion 41/11 (Mk7 330M RWD)
+    double eff        = 0.92;     // driveline efficiency
     int    gear       = 1;        // 0 = neutral .. gears()
 
     int    gears() const { return (int)ratio.size()-1; }  // forward gear count
@@ -76,7 +82,8 @@ struct Tire {
     // shape coefficients (carcass) held fixed; D and B rebuilt from mu, Fz.
     double C = 1.60;
     double E = 0.97;
-    double Kstiff = 78000.0;   // longitudinal slip stiffness B*C*D (held fixed)
+    double Kstiff = 100000.0;  // longitudinal slip stiffness B*C*D (held fixed)
+                               // 235/65 R16C load-rated van carcass
 
     double D(double mu,double Fz)  const;
     double B(double mu,double Fz)  const;
@@ -86,16 +93,24 @@ struct Tire {
 
 // ----------------------------- wheel ----------------------------------------
 struct Wheel {
-    double I      = 0.9;     // wheel+hub inertia [kg m^2]
-    double r      = 0.31;    // rolling radius [m]
+    double I      = 1.6;     // wheel+hub inertia [kg m^2] (16" van wheel)
+    double r      = 0.345;   // rolling radius [m] (235/65 R16C)
     double omega  = 0.0;     // spin speed [rad/s]
     double kappa  = 0.0;     // slip ratio (relaxation state)
     double angle  = 0.0;     // visual spin angle
     bool   driven = false;
     double Fx     = 0.0;     // last longitudinal force (for display)
-    double Fz     = 3200.0;  // vertical load
+    double Fz     = 5765.0;  // vertical load (2350 kg kerb / 4 corners)
     double px     = 0.0;     // longitudinal position (forward = +) [m]
     double pz     = 0.0;     // lateral position (left = +) [m]
+
+    // ---- external (3D rig) mode only --------------------------------------
+    // Each wheel rolls along its own heading over its own patch of ground, so
+    // the slip model needs a per-wheel contact speed rather than the body's.
+    double vx      = 0.0;    // ground speed at the contact, along the wheel [m/s]
+    double steer   = 0.0;    // steer angle about the suspension axis [rad]
+    bool   grounded= true;   // airborne wheels make no force
+    double brakeMax= 3000.0; // brake torque at full pedal [Nm]
 };
 
 // ----------------------------- differential ---------------------------------
@@ -119,11 +134,21 @@ struct Differential {
 };
 
 // ----------------------------- vehicle --------------------------------------
+// Ford Transit Mk7 330M (MWB, medium roof), RWD, unladen.
 struct Vehicle {
-    double mass=1300.0, v=0.0, x=0.0, accel=0.0;
-    double cgH=0.52, wheelbase=2.60;
-    double Cd=0.32, A=2.2, rho=1.225, Crr=0.013, g=9.81;
+    double mass=2350.0, v=0.0, x=0.0, accel=0.0;   // kerb mass (3500 kg GVM)
+    double cgH=0.75, wheelbase=3.30;               // tall body, 3300 mm wheelbase
+    double Cd=0.36, A=4.2, rho=1.225, Crr=0.012, g=9.81;   // big flat-fronted box
     double sigma=0.35;        // tire relaxation length [m]
+    double vRelaxMin=1.5;     // slip-relaxation speed floor [m/s], see sim.cpp:
+                              // stops a locked wheel holding its braking force
+                              // through zero speed and rocking the car
+    double vStick=0.5;        // below this the contact acts as a damper [m/s].
+                              // Keep it small: it must die out well before the
+                              // wheels are really rolling, or axles with
+                              // different tread speeds get different amounts of
+                              // it and fight each other with kilonewtons.
+    double stickC=30000.0;    // that damper's rate, per wheel [N per m/s]
 
     Engine  eng;
     Clutch  clu;
