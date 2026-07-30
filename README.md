@@ -66,7 +66,15 @@ The sliders on the left do the same things if you prefer the mouse.
 
 ## Where the feedback loop lives in the code
 
-In `Vehicle::step()`:
+`sim.h` is a backend-agnostic API (`namespace vsim`): a host feeds a
+`vsim::StepInput` (driver `Command` + one `ContactIn` per wheel) into a
+`vsim::IVehicleSim` and reads back `wheelOutputs()` and `telemetry()`. The Ford
+Transit manual drivetrain is one implementation of it, `vsim::ManualDrivetrain`
+in `drivetrain.h`/`drivetrain.cpp`; swapping in an EV, an automatic or a
+different physics backend means writing another `IVehicleSim`, not touching the
+front-ends.
+
+In `ManualDrivetrain::integrate()`:
 - `omegaIn = omegaCarrier * n;`  -> wheel speed reflected **back up** to the engine.
 - `Treact = wh.Fx * wh.r;`       -> tire load reflected **back up** the chain.
 

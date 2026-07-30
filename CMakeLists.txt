@@ -45,7 +45,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JoltPhysics)
 
-add_executable(carsim main.cpp sim.cpp physics.cpp)
+add_executable(carsim main.cpp sim.cpp drivetrain.cpp physics.cpp)
 target_include_directories(carsim PRIVATE ${raygui_SOURCE_DIR}/src)
 target_link_libraries(carsim PRIVATE raylib Jolt)
 
@@ -81,7 +81,7 @@ endif()
 # ---- van simulator (fourth executable) -------------------------------------
 # Same Transit model as carsim, but the drivetrain is ours end to end: Jolt only
 # supplies the chassis rigid body, the suspension raycasts and the collision.
-add_executable(vansim van_main.cpp sim.cpp physics.cpp)
+add_executable(vansim van_main.cpp sim.cpp drivetrain.cpp physics.cpp)
 target_include_directories(vansim PRIVATE ${raygui_SOURCE_DIR}/src)
 target_link_libraries(vansim PRIVATE raylib Jolt)
 add_custom_command(TARGET vansim POST_BUILD

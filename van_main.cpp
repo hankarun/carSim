@@ -24,6 +24,7 @@
 #include "raygui.h"
 
 #include "sim.h"
+#include "drivetrain.h"
 #include "physics.h"
 
 #include <cmath>
@@ -187,8 +188,9 @@ static Vector3 gCamPos = {6.0f,5.0f,8.0f};
 // screen -- an orbit that starts ahead of the nose mirrors the steering
 static float   gOrbitYaw=-1.9f, gOrbitPitch=0.42f, gOrbitDist=14.0f;
 
-static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
-                        Model terrain, const phys::Susp& susp, Vector3 com){
+static void DrawScene3D(Rectangle view, phys::World& world,
+                        const vsim::Layout& rig, const vsim::WheelOut* wout,
+                        Model terrain, const phys::Susp& susp){
     static RenderTexture2D rt{};
     if(rt.id==0 || rt.texture.width!=(int)view.width
                 || rt.texture.height!=(int)view.height){
@@ -241,14 +243,16 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
     DrawCubeWires({0,0,0},dims[0],dims[1],dims[2],Color{120,150,200,255});
     rlPopMatrix();
 
-    Vector3 comW=Vector3Add(pos,Vector3RotateByQuaternion({com.x,com.y,com.z},q));
+    Vector3 comW=Vector3Add(pos,Vector3RotateByQuaternion(
+                      {(float)rig.body.comX,(float)rig.body.comY,(float)rig.body.comZ},q));
     DrawSphere(comW,0.13f,Color{235,80,70,255});
 
     // wheels + suspension rays
     const auto& wo = world.wheels();
     for(size_t i=0;i<wo.size();++i){
         Vector3 c={wo[i].x,wo[i].y,wo[i].z};
-        float wr=(i<car.wheels.size())?(float)car.wheels[i].r:0.345f;
+        bool    known = i<rig.wheels.size();
+        float wr=known?(float)rig.wheels[i].radius:0.345f;
         float hw=0.118f;
         float st=wo[i].steer;
         // must match the wheel axes stepRig() builds, or the wheels appear to
@@ -258,10 +262,10 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
         Vector3 wRight=Vector3Subtract(Vector3Scale(right,std::cos(st)),
                                        Vector3Scale(fwd,  std::sin(st)));
         // suspension ray from the attach point down to the contact
-        if(i<car.wheels.size()){
-            Vector3 local={(float)car.wheels[i].px,
-                           -dims[1]*0.5f+0.50f,
-                           (float)car.wheels[i].pz};
+        if(known){
+            Vector3 local={(float)rig.wheels[i].px,
+                           (float)rig.wheels[i].py,
+                           (float)rig.wheels[i].pz};
             Vector3 attach=Vector3Add(pos,Vector3RotateByQuaternion(local,q));
             Color rc = wo[i].grounded ? Color{110,200,120,160}
                                       : Color{240,160,90,140};
@@ -270,15 +274,15 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
 
         Vector3 a=Vector3Subtract(c,Vector3Scale(wRight,hw));
         Vector3 b=Vector3Add(c,Vector3Scale(wRight,hw));
-        bool drv=(i<car.wheels.size())&&car.wheels[i].driven;
-        double kap=(i<car.wheels.size())?std::fabs(car.wheels[i].kappa):0.0;
+        bool drv=known&&rig.wheels[i].driven;
+        double kap=known?std::fabs(wout[i].kappa):0.0;
         bool sp = kap>0.12;
         Color tc= sp?Color{200,60,55,255}:(drv?Color{40,44,54,255}:Color{28,30,36,255});
         DrawCylinderEx(a,b,wr,wr,14,tc);
         DrawCylinderWiresEx(a,b,wr,wr,14,Color{110,114,124,255});
         if(!wo[i].grounded) DrawSphere(c,0.05f,Color{240,160,90,255});
 
-        float aa=(i<car.wheels.size())?(float)car.wheels[i].angle:0.0f;
+        float aa=known?(float)wout[i].angle:0.0f;
         Vector3 fa=Vector3Add(a,Vector3Scale(wRight,-0.02f));
         Vector3 fb=Vector3Add(b,Vector3Scale(wRight, 0.02f));
         const int SPK=4;
@@ -333,8 +337,11 @@ static void DrawScene3D(Rectangle view, phys::World& world, const Vehicle& car,
 }
 
 // ----------------------------- tuning panel ---------------------------------
-static void DrawTuning(Rectangle panel, Vehicle& car, int& tab, int& pointSel,
-                       int& gearSel, phys::Susp& susp, int& suspPreset){
+// Bound to the CONCRETE model on purpose: a tuning panel edits a specific
+// drivetrain (this engine curve, these gear ratios), not an abstract one.
+static void DrawTuning(Rectangle panel, vsim::ManualDrivetrain& car, int& tab,
+                       int& pointSel, int& gearSel, phys::Susp& susp,
+                       int& suspPreset){
     DrawRectangleRec(panel,Color{26,28,34,255});
     DrawRectangleLinesEx(panel,1,Color{60,64,74,255});
     DrawText("DRIVETRAIN TUNING  (sim stopped)",(int)panel.x+12,(int)panel.y+8,16,
@@ -424,7 +431,7 @@ static void DrawTuning(Rectangle panel, Vehicle& car, int& tab, int& pointSel,
                                               :car.wheels[0].I,0.4f,4.0f,"%.2f");
         if(!car.wheels.empty()){
             double wi=car.wheels[0].I;
-            for(Wheel& wh:car.wheels) wh.I=wi;
+            for(vsim::WheelState& wh:car.wheels) wh.I=wi;
         }
         dSlider({cx+130,cy+94,210,20},"Relax length",car.sigma,0.10f,1.00f,"%.2f m");
         int lx=(int)panel.x+400, ly=(int)panel.y+64;
@@ -468,15 +475,20 @@ int main(){
     bool haveSnd = engSnd.frameCount>0;
     if(haveSnd){ engSnd.looping=true; PlayMusicStream(engSnd); }
 
-    Vehicle car;
-    car.external = true;              // Jolt integrates the chassis, we do the rest
+    // The concrete model is held by value so the tuning panel can edit it, but
+    // every per-frame call goes through the API below.  Dropping in a different
+    // IVehicleSim (an EV, an automatic, a tracked rig) only touches these lines.
+    vsim::ManualDrivetrain van;
+    van.external = true;              // Jolt integrates the chassis, we do the rest
+    vsim::IVehicleSim& sim = van;
+    vsim::Layout rig;                 // refreshed whenever the rig is rebuilt
+
     float throttle=0, clutchEng=1.0f, brake=0, steer=0;
+    int   gear=0;                     // the shifter lives with the host now
+    int   surf=0;
     bool  running=true, prevRunning=true, soundOn=false;
     int   tuneTab=0, pointSel=0, gearSel=1;
     Plot  pRPM,pWheel,pSlip,pForce;
-
-    const float MAX_STEER = 36.0f*DEG2RAD;
-    const int   SUB = 8;              // drivetrain substeps per rendered frame
 
     // --- 3D world ---------------------------------------------------------
     const int   TN=256;
@@ -506,29 +518,25 @@ int main(){
 
     int        suspPreset = phys::SUSP_UNLADEN;
     phys::Susp susp = phys::suspPreset(suspPreset);
-    Vector3    com  = {0.16f,-0.45f,0.0f};
 
-    // build the raycast rig from the wheel layout (no Jolt drivetrain at all)
+    // build the raycast rig straight from whatever body/wheel layout the sim
+    // describes -- the host no longer knows this vehicle's dimensions
     auto buildRig=[&](){
-        if(car.wheels.empty()) return;
-        float minx=1e9f,maxx=-1e9f,minz=1e9f,maxz=-1e9f;
-        for(const Wheel& wh: car.wheels){
-            minx=std::min(minx,(float)wh.px); maxx=std::max(maxx,(float)wh.px);
-            minz=std::min(minz,(float)wh.pz); maxz=std::max(maxz,(float)wh.pz); }
-        float blen=std::max((maxx-minx)+2.38f,1.2f);
-        float bwid=std::max((maxz-minz)+0.25f,0.8f);
-        float bhei=2.05f;
-        float attachY=-bhei*0.5f+0.50f;
+        rig = sim.layout();
+        if(rig.wheels.empty()) return;
 
         std::vector<float> ox,oy,oz;
-        for(const Wheel& wh: car.wheels){
-            ox.push_back((float)wh.px); oy.push_back(attachY); oz.push_back((float)wh.pz); }
+        for(const vsim::WheelSpec& w : rig.wheels){
+            ox.push_back((float)w.px); oy.push_back((float)w.py); oz.push_back((float)w.pz); }
 
-        susp.radius = car.wheels.empty()? 0.345f : (float)car.wheels[0].r;
+        susp.radius = (float)rig.wheels[0].radius;
         world.setSusp(susp);
-        world.buildRig(ox,oy,oz,blen,bhei,bwid,(float)car.mass,
-                       0.0f,spawnH,0.0f, com.x,com.y,com.z);
-        car.reset();
+        world.buildRig(ox,oy,oz,
+                       (float)rig.body.length,(float)rig.body.height,(float)rig.body.width,
+                       (float)rig.body.mass, 0.0f,spawnH,0.0f,
+                       (float)rig.body.comX,(float)rig.body.comY,(float)rig.body.comZ);
+        sim.reset();
+        gear = 0;
     };
 
     int terrainMode=0;
@@ -572,86 +580,98 @@ int main(){
         if(IsKeyDown(KEY_A)||IsKeyDown(KEY_LEFT))  steerTgt=-1.0f;
         if(IsKeyDown(KEY_D)||IsKeyDown(KEY_RIGHT)) steerTgt=+1.0f;
         steer += (steerTgt-steer)*0.18f;
-        if(IsKeyPressed(KEY_E)&&car.box.gear<car.box.gears()) car.box.gear++;
-        if(IsKeyPressed(KEY_Q)&&car.box.gear>0) car.box.gear--;
-        if(IsKeyPressed(KEY_ONE))   car.surf=0;
-        if(IsKeyPressed(KEY_TWO))   car.surf=1;
-        if(IsKeyPressed(KEY_THREE)) car.surf=2;
+        if(IsKeyPressed(KEY_E)&&gear<van.box.gears()) gear++;
+        if(IsKeyPressed(KEY_Q)&&gear>0) gear--;
+        if(IsKeyPressed(KEY_ONE))   surf=0;
+        if(IsKeyPressed(KEY_TWO))   surf=1;
+        if(IsKeyPressed(KEY_THREE)) surf=2;
         if(IsKeyPressed(KEY_P))     running=!running;
         if(IsKeyPressed(KEY_M))     soundOn=!soundOn;
-        if(IsKeyPressed(KEY_R)) { car.reset(); world.resetVehicle(0,spawnH,0);
+        if(IsKeyPressed(KEY_R)) { sim.reset(); gear=0; world.resetVehicle(0,spawnH,0);
                                   world.resetObstacles(); throttle=brake=0; clutchEng=1; }
 
-        car.clu.engagement = clutchEng;
+        gear = (int)clampd(gear, 0, van.box.gears());
         if(running && !prevRunning) buildRig();
         prevRunning = running;
 
         // ================= the actual simulation ==========================
         if(running && world.hasVehicle()){
             float bp0[3]; world.bodyPosition(bp0);
-            car.surf = surfZone(bp0[0], bp0[2]);
+            surf = surfZone(bp0[0], bp0[2]);
+            double mu = SURFACES[surf].mu;
 
             const auto& wo = world.wheels();
-            int N=(int)car.wheels.size();
+            int N = sim.wheelCount();
 
             // 1) pull each wheel's load and contact speed out of the rig
-            for(int i=0;i<N && i<(int)wo.size();++i){
-                car.wheels[i].Fz       = wo[i].grounded ? wo[i].Fz : 0.0;
-                car.wheels[i].vx       = wo[i].vx;
-                car.wheels[i].grounded = wo[i].grounded!=0;
-                // front wheels steer
-                car.wheels[i].steer = (car.wheels[i].px > 0.01)
-                                        ? steer*MAX_STEER : 0.0;
+            std::vector<vsim::ContactIn> contacts((size_t)N);
+            for(int i=0;i<N;++i){
+                if(i<(int)wo.size()){
+                    contacts[i].Fz       = wo[i].Fz;
+                    contacts[i].vx       = wo[i].vx;
+                    contacts[i].grounded = wo[i].grounded!=0;
+                }
+                contacts[i].mu = mu;
             }
 
-            // 2) OUR drivetrain: engine -> clutch -> gearbox -> diffs -> tyres.
-            //    Substepped because the clutch/driveline is a stiff coupling.
+            // 2) the drivetrain: engine -> clutch -> gearbox -> diffs -> tyres.
+            //    It substeps internally, so the host just hands it the frame.
             float dt=1.0f/60.0f;
-            for(int s=0;s<SUB;s++) car.step(dt/SUB, throttle, brake);
+            vsim::StepInput sin_;
+            sin_.cmd.throttle = throttle;
+            sin_.cmd.brake    = brake;
+            sin_.cmd.clutch   = clutchEng;
+            sin_.cmd.steer    = steer;
+            sin_.cmd.gear     = gear;
+            sin_.bodySpeed    = world.forwardSpeed();
+            sin_.contacts     = contacts.data();
+            sin_.contactCount = N;
+            sim.step(dt, sin_);
 
             // 3) hand the tyre forces back to Jolt and integrate the chassis
-            std::vector<phys::RigWheelIn> in((size_t)N);
+            const vsim::WheelOut* w = sim.wheelOutputs();
+            std::vector<phys::RigWheelIn> rin((size_t)N);
             for(int i=0;i<N;++i){
-                in[i].steer = (float)car.wheels[i].steer;
-                in[i].Fx    = (float)car.wheels[i].Fx;
+                rin[i].steer = (float)w[i].steer;
+                rin[i].Fx    = (float)w[i].Fx;
             }
-            world.stepRig(dt, in, SURFACES[car.surf].mu);
-
-            car.v = world.forwardSpeed();
+            world.stepRig(dt, rin, (float)mu);
 
             float bp[3]; world.bodyPosition(bp);
             float half = TSPAN*0.5f;
             if(bp[1] < -10.0f || std::fabs(bp[0])>half+4.0f || std::fabs(bp[2])>half+4.0f){
-                world.resetVehicle(0,spawnH,0); car.reset();
+                world.resetVehicle(0,spawnH,0); sim.reset(); gear=0;
             }
         }
 
         // ---- telemetry ----------------------------------------------------
-        int mon=-1;
-        for(int i=0;i<(int)car.wheels.size();++i) if(car.wheels[i].driven){ mon=i; break; }
-        if(mon<0) mon=0;
-        bool haveW = !car.wheels.empty();
+        const vsim::WheelOut* wout = sim.wheelOutputs();
+        vsim::Telemetry      tm    = sim.telemetry();
 
-        double rpm  = car.eng.omega*RAD2RPM;
-        double kmh  = car.v*3.6;
-        double n    = car.box.n();
-        double carrier=0.0; int nd=car.drivenCount();
-        if(nd>0){ for(const Wheel& wh:car.wheels) if(wh.driven) carrier+=wh.omega; carrier/=nd; }
-        double wheelRPM = carrier*n*RAD2RPM;
-        double monFz = haveW? car.wheels[mon].Fz : 0.0;
-        double monK  = haveW? car.wheels[mon].kappa : 0.0;
-        double monFx = haveW? car.wheels[mon].Fx : 0.0;
-        double kP    = car.tire.kappaPeak(SURFACES[car.surf].mu, std::max(monFz,1.0));
+        int mon=-1;
+        for(int i=0;i<(int)rig.wheels.size();++i) if(rig.wheels[i].driven){ mon=i; break; }
+        if(mon<0) mon=0;
+        bool haveW = !rig.wheels.empty();
+
+        double rpm  = tm.engineRPM;
+        double kmh  = tm.speed*3.6;
+        double n    = tm.gearRatio;
+        int    nd   = tm.drivenWheels;
+        double wheelRPM = tm.carrierOmega*n*RAD2RPM;
+        double monFz = haveW? wout[mon].Fz : 0.0;
+        double monK  = haveW? wout[mon].kappa : 0.0;
+        double monFx = haveW? wout[mon].Fx : 0.0;
+        double kP    = van.tire.kappaPeak(SURFACES[surf].mu, std::max(monFz,1.0));
         if(running){
             pRPM.push((float)rpm); pWheel.push((float)wheelRPM);
             pSlip.push((float)monK); pForce.push((float)monFx);
         }
 
         if(haveSnd){
-            double frac = (rpm - car.eng.idleRPM)/(car.eng.redline - car.eng.idleRPM);
+            double frac = (rpm - tm.idleRPM)/(tm.redline - tm.idleRPM);
             frac = clampd(frac, 0.0, 1.0);
             SetMusicPitch(engSnd, (float)(0.85 + frac*2.15));
-            bool silent = !soundOn || car.eng.stalled || !running;
+            bool silent = !soundOn || tm.engineStalled || !running;
             SetMusicVolume(engSnd, silent?0.0f:1.0f);
             UpdateMusicStream(engSnd);
         }
@@ -675,15 +695,13 @@ int main(){
         GuiSlider({110,122,150,22},"Brake",  TextFormat("%.2f",brake),&brake,0,1);
 
         DrawText("GEAR",20,160,16,Color{150,160,175,255});
-        if(GuiButton({90,156,40,26},"-")&&car.box.gear>0) car.box.gear--;
-        const char* gname = car.box.gear==0?"N":TextFormat("%d",car.box.gear);
+        if(GuiButton({90,156,40,26},"-")&&gear>0) gear--;
+        const char* gname = gear==0?"N":TextFormat("%d",gear);
         DrawText(gname,150,160,20,RAYWHITE);
-        if(GuiButton({180,156,40,26},"+")&&car.box.gear<car.box.gears()) car.box.gear++;
+        if(GuiButton({180,156,40,26},"+")&&gear<tm.gearCount) gear++;
 
         DrawText("SURFACE",20,200,16,Color{150,160,175,255});
-        int surfSel=car.surf;
-        GuiToggleGroup({100,196,55,26},"DRY;WET;ICE",&surfSel);
-        car.surf=surfSel;
+        GuiToggleGroup({100,196,55,26},"DRY;WET;ICE",&surf);
 
         Color simBtnCol = running ? Color{200,80,70,255} : Color{90,180,110,255};
         int prevBase  = GuiGetStyle(BUTTON,BASE_COLOR_NORMAL);
@@ -691,7 +709,8 @@ int main(){
         if(GuiButton({20,238,170,30}, running?"#132#STOP  (P)":"#131#PLAY  (P)"))
             running=!running;
         GuiSetStyle(BUTTON,BASE_COLOR_NORMAL,prevBase);
-        if(GuiButton({200,238,80,30},"Reset")){ car.reset(); world.resetVehicle(0,spawnH,0);
+        if(GuiButton({200,238,80,30},"Reset")){ sim.reset(); gear=0;
+            world.resetVehicle(0,spawnH,0);
             world.resetObstacles(); throttle=brake=0; clutchEng=1; }
         DrawText(running?"SIM: RUNNING":"SIM: STOPPED (tunable)",20,276,14,
                  running?Color{120,220,140,255}:Color{240,200,90,255});
@@ -704,34 +723,35 @@ int main(){
         auto line=[&](const char*k,const char*v,Color c){
             DrawText(k,20,ry,16,Color{150,160,175,255});
             DrawText(v,150,ry,16,c); ry+=23; };
-        line("Engine", car.eng.stalled?"STALLED":TextFormat("%.0f rpm",rpm),
-                       car.eng.stalled?Color{240,90,80,255}:RAYWHITE);
+        line("Engine", tm.engineStalled?"STALLED":TextFormat("%.0f rpm",rpm),
+                       tm.engineStalled?Color{240,90,80,255}:RAYWHITE);
         line("Speed",  TextFormat("%.1f km/h",kmh),RAYWHITE);
-        line("Clutch", car.clu.lockedish?"LOCKED":"slipping",
-                       car.clu.lockedish?Color{120,220,140,255}:Color{240,200,90,255});
-        line("Reduction", car.box.gear? TextFormat("%.2f :1",n):"neutral",RAYWHITE);
-        line("Surface", SURFACES[car.surf].name,
-             car.surf==0?Color{120,220,140,255}:
-             car.surf==1?Color{110,170,230,255}:Color{200,220,240,255});
+        line("Clutch", tm.clutchLocked?"LOCKED":"slipping",
+                       tm.clutchLocked?Color{120,220,140,255}:Color{240,200,90,255});
+        line("Reduction", gear? TextFormat("%.2f :1",n):"neutral",RAYWHITE);
+        line("Surface", SURFACES[surf].name,
+             surf==0?Color{120,220,140,255}:
+             surf==1?Color{110,170,230,255}:Color{200,220,240,255});
 
         // per-wheel telemetry table
         ry+=6;
         DrawText("WHEEL   Fz(N)   slip     rpm",20,ry,13,Color{150,160,175,255}); ry+=18;
-        for(int i=0;i<(int)car.wheels.size();++i){
-            const Wheel& wh=car.wheels[i];
-            Color c = !wh.grounded ? Color{240,160,90,255}
-                    : (std::fabs(wh.kappa)>kP*1.05 ? Color{240,90,80,255} : RAYWHITE);
+        const auto& wviz = world.wheels();
+        for(int i=0;i<(int)rig.wheels.size();++i){
+            bool grounded = (i<(int)wviz.size()) ? wviz[i].grounded!=0 : true;
+            Color c = !grounded ? Color{240,160,90,255}
+                    : (std::fabs(wout[i].kappa)>kP*1.05 ? Color{240,90,80,255} : RAYWHITE);
             DrawText(TextFormat("%d %s  %6.0f  %+5.2f  %6.0f",
-                     i+1, wh.driven?"D":" ", wh.Fz, wh.kappa,
-                     wh.omega*RAD2RPM), 20,ry,13,c);
+                     i+1, rig.wheels[i].driven?"D":" ", wout[i].Fz, wout[i].kappa,
+                     wout[i].omega*RAD2RPM), 20,ry,13,c);
             ry+=16;
         }
-        if(car.eng.stalled)
+        if(tm.engineStalled)
             DrawText("engine dead - clutch in or\nneutral to restart",20,ry+6,13,
                      Color{240,90,80,255});
 
         // --- 3D view --------------------------------------------------------
-        DrawScene3D(scene, world, car, terrain, susp, com);
+        DrawScene3D(scene, world, rig, wout, terrain, susp);
 
         int tmode=terrainMode;
         GuiToggleGroup({scene.x+scene.width-150,scene.y+8,68,22},"NOISE;FLAT",&tmode);
@@ -740,8 +760,8 @@ int main(){
         float gR=std::min(70.0f, scene.width*0.075f);
         DrawGauge({scene.x+gR+14, scene.y+scene.height-gR-14}, gR,
                   rpm,5000,"RPM x1000",
-                  car.eng.stalled?"DEAD":TextFormat("%.1f",rpm/1000.0),
-                  car.eng.redline/5000.0);
+                  tm.engineStalled?"DEAD":TextFormat("%.1f",rpm/1000.0),
+                  tm.redline/5000.0);
         DrawGauge({scene.x+scene.width-gR-14, scene.y+scene.height-gR-14}, gR,
                   std::fabs(kmh),180,"km/h",TextFormat("%.0f",std::fabs(kmh)),1.0);
 
@@ -762,19 +782,19 @@ int main(){
             DrawRectangleLinesEx(info,1,Color{60,64,74,255});
             DrawText("DRIVELINE",(int)info.x+8,(int)info.y+6,14,Color{150,160,175,255});
             DrawText(TextFormat("engine  %.0f rpm  %s",rpm,
-                     car.eng.stalled?"(dead)":""),(int)info.x+8,(int)info.y+26,13,RAYWHITE);
+                     tm.engineStalled?"(dead)":""),(int)info.x+8,(int)info.y+26,13,RAYWHITE);
             DrawText(TextFormat("clutch  %.0f%% engaged, %s",clutchEng*100.0f,
-                     car.clu.lockedish?"locked":"slipping"),
+                     tm.clutchLocked?"locked":"slipping"),
                      (int)info.x+8,(int)info.y+44,13,RAYWHITE);
             DrawText(TextFormat("gearbox %s  reduction %.2f",
-                     car.box.gear?TextFormat("gear %d",car.box.gear):"neutral",n),
+                     gear?TextFormat("gear %d",gear):"neutral",n),
                      (int)info.x+8,(int)info.y+62,13,RAYWHITE);
             DrawText(TextFormat("diffs   %d   driven wheels %d",
-                     (int)car.diffs.size(),nd),(int)info.x+8,(int)info.y+80,13,RAYWHITE);
-            DrawText(TextFormat("slip peak k = %.3f on %s",kP,SURFACES[car.surf].name),
+                     (int)van.diffs.size(),nd),(int)info.x+8,(int)info.y+80,13,RAYWHITE);
+            DrawText(TextFormat("slip peak k = %.3f on %s",kP,SURFACES[surf].name),
                      (int)info.x+8,(int)info.y+98,13,Color{120,128,140,255});
         } else {
-            DrawTuning(lower, car, tuneTab, pointSel, gearSel, susp, suspPreset);
+            DrawTuning(lower, van, tuneTab, pointSel, gearSel, susp, suspPreset);
         }
 
         EndDrawing();

@@ -15,6 +15,7 @@
 #include "raygui.h"
 
 #include "sim.h"
+#include "drivetrain.h"
 #include "physics.h"
 
 #include <cmath>
