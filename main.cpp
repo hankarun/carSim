@@ -614,25 +614,18 @@ int main(){
     // onto phys::Drivetrain here.
     auto buildVeh=[&](){
         if(car.wheels.empty()) return;
-        float minx=1e9f,maxx=-1e9f,minz=1e9f,maxz=-1e9f;
-        for(const Wheel& wh: car.wheels){
-            minx=std::min(minx,(float)wh.px); maxx=std::max(maxx,(float)wh.px);
-            minz=std::min(minz,(float)wh.pz); maxz=std::max(maxz,(float)wh.pz); }
-        // Transit MWB: 5.68 m long over a 3.30 m wheelbase (2.38 m of overhang),
-        // 1.97 m wide, and a 2.05 m tall box for the medium-roof load bay.
-        float blen=std::max((maxx-minx)+2.38f,1.2f);
-        float bwid=std::max((maxz-minz)+0.25f,0.8f);
-        float bhei=2.05f;
-        // the box is centred on the body origin, so the suspension tops hang
-        // 0.50 m above its underside -- that puts the wheels below the floor
-        // and leaves ~0.20 m of ground clearance.
-        float attachY=-bhei*0.5f+0.50f;
+        // one source of truth: the drivetrain describes its own body box and
+        // suspension attach points (see ManualDrivetrain::layout())
+        const vsim::Layout L = car.layout();
+        float blen=(float)L.body.length;
+        float bwid=(float)L.body.width;
+        float bhei=(float)L.body.height;
 
         std::vector<float> ox,oy,oz;
         std::vector<int>   driven;
-        for(const Wheel& wh: car.wheels){
-            ox.push_back((float)wh.px); oy.push_back(attachY); oz.push_back((float)wh.pz);
-            driven.push_back(wh.driven?1:0); }
+        for(const vsim::WheelSpec& w : L.wheels){
+            ox.push_back((float)w.px); oy.push_back((float)w.py); oz.push_back((float)w.pz);
+            driven.push_back(w.driven?1:0); }
 
         phys::Drivetrain dt;
         dt.minRPM  = (float)car.eng.idleRPM;
@@ -657,7 +650,7 @@ int main(){
         }
 
         world.setSusp(susp);
-        world.buildVehicle(ox,oy,oz,driven,dt,blen,bhei,bwid,(float)car.mass,
+        world.buildVehicle(ox,oy,oz,driven,dt,blen,bhei,bwid,(float)car.totalMass(),
                            0.0f,spawnH,0.0f, com.x,com.y,com.z);
         car.reset();
     };

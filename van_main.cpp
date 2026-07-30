@@ -341,7 +341,7 @@ static void DrawScene3D(Rectangle view, phys::World& world,
 // drivetrain (this engine curve, these gear ratios), not an abstract one.
 static void DrawTuning(Rectangle panel, vsim::ManualDrivetrain& car, int& tab,
                        int& pointSel, int& gearSel, phys::Susp& susp,
-                       int& suspPreset){
+                       int& suspPreset, int& loadMode){
     DrawRectangleRec(panel,Color{26,28,34,255});
     DrawRectangleLinesEx(panel,1,Color{60,64,74,255});
     DrawText("DRIVETRAIN TUNING  (sim stopped)",(int)panel.x+12,(int)panel.y+8,16,
@@ -425,19 +425,50 @@ static void DrawTuning(Rectangle panel, vsim::ManualDrivetrain& car, int& tab,
                  (int)cx,(int)cy+132,13,Color{120,128,140,255});
     }
     else if(tab==3){                              // ---------------- BODY
-        dSlider({cx+130,cy+4,210,20},"Vehicle mass",car.mass,600.0f,3800.0f,"%.0f kg");
-        dSlider({cx+130,cy+34,210,20},"Flywheel I",car.eng.I,0.10f,0.90f,"%.2f");
-        dSlider({cx+130,cy+64,210,20},"Wheel I",car.wheels.empty()?car.sigma
+        DrawText("Load",(int)cx,(int)cy+4,16,Color{150,160,175,255});
+        int oldLoad=loadMode;
+        GuiToggleGroup({cx+70,cy,66,26},"EMPTY;HALF;LADEN;2.5 t",&loadMode);
+        if(loadMode!=oldLoad && loadMode>=0)
+            car.payload = vsim::loadModePayload(loadMode);
+        dSlider({cx+130,cy+38,210,20},"Payload",  car.payload,0.0f,2500.0f,"%.0f kg");
+        dSlider({cx+130,cy+68,210,20},"Kerb mass",car.mass,   600.0f,3800.0f,"%.0f kg");
+        // dragging the slider drops out of the named modes
+        if(std::fabs(car.payload-vsim::loadModePayload(loadMode))>0.5) loadMode=-1;
+        dSlider({cx+130,cy+98,210,20},"Flywheel I",car.eng.I,0.10f,0.90f,"%.2f");
+        dSlider({cx+130,cy+128,210,20},"Wheel I",car.wheels.empty()?car.sigma
                                               :car.wheels[0].I,0.4f,4.0f,"%.2f");
         if(!car.wheels.empty()){
             double wi=car.wheels[0].I;
             for(vsim::WheelState& wh:car.wheels) wh.I=wi;
         }
-        dSlider({cx+130,cy+94,210,20},"Relax length",car.sigma,0.10f,1.00f,"%.2f m");
+        dSlider({cx+130,cy+158,210,20},"Relax length",car.sigma,0.10f,1.00f,"%.2f m");
+
+        // static axle split about the loaded CoM, same maths the sim uses
+        double front=0.5;
+        {
+            int nf=0,nr=0; double pxF=0,pxR=0;
+            for(const vsim::WheelState& wh:car.wheels){
+                if(wh.px>0){ nf++; pxF+=wh.px; } else { nr++; pxR+=wh.px; } }
+            if(nf>0&&nr>0){ pxF/=nf; pxR/=nr;
+                front=clampd((car.loadedComX()-pxR)/std::max(1e-3,pxF-pxR),0.05,0.95); }
+        }
         int lx=(int)panel.x+400, ly=(int)panel.y+64;
-        DrawText(TextFormat("mass: %.0f kg (GVM 3500)",car.mass),lx,ly,15,
-                 Color{120,200,240,255});
-        DrawText("Changes apply when you press PLAY.",lx,ly+26,13,Color{200,180,120,255});
+        double tot=car.totalMass();
+        DrawText(TextFormat("kerb %.0f + load %.0f = %.0f kg",car.mass,car.payload,tot),
+                 lx,ly,15,Color{120,200,240,255});
+        DrawText(TextFormat("GVM 3500 kg  -  %s",tot>3500.0?"OVERLOADED":"legal"),
+                 lx,ly+22,15,tot>3500.0?Color{230,120,110,255}:Color{120,200,240,255});
+        DrawText(TextFormat("static split  %.0f / %.0f  front/rear",
+                 front*100.0,(1.0-front)*100.0),lx,ly+44,15,Color{150,160,175,255});
+        DrawText(TextFormat("CoM %.2f m fwd, %.2f m up",car.loadedComX(),car.loadedCgH()),
+                 lx,ly+66,15,Color{150,160,175,255});
+        DrawText("Load rides low and aft, so it also moves the CoM.",
+                 lx,ly+92,13,Color{120,128,140,255});
+        DrawText("Past ~half load the unladen springs bottom out:",
+                 lx,ly+112,13,Color{120,128,140,255});
+        DrawText("switch the SUSP tab to LADEN to carry it properly.",
+                 lx,ly+128,13,Color{120,128,140,255});
+        DrawText("Changes apply when you press PLAY.",lx,ly+150,13,Color{200,180,120,255});
     }
     else {                                        // ---------------- SUSP
         DrawText("Preset",(int)cx,(int)cy+4,16,Color{150,160,175,255});
@@ -518,6 +549,7 @@ int main(){
 
     int        suspPreset = phys::SUSP_UNLADEN;
     phys::Susp susp = phys::suspPreset(suspPreset);
+    int        loadMode = vsim::LOAD_EMPTY;   // payload preset, BODY tab
 
     // build the raycast rig straight from whatever body/wheel layout the sim
     // describes -- the host no longer knows this vehicle's dimensions
@@ -794,7 +826,7 @@ int main(){
             DrawText(TextFormat("slip peak k = %.3f on %s",kP,SURFACES[surf].name),
                      (int)info.x+8,(int)info.y+98,13,Color{120,128,140,255});
         } else {
-            DrawTuning(lower, van, tuneTab, pointSel, gearSel, susp, suspPreset);
+            DrawTuning(lower, van, tuneTab, pointSel, gearSel, susp, suspPreset, loadMode);
         }
 
         EndDrawing();

@@ -145,13 +145,13 @@ Layout ManualDrivetrain::layout() const {
             minz=std::min(minz,wh.pz); maxz=std::max(maxz,wh.pz);
         }
     }
-    L.body.mass     = mass;
+    L.body.mass     = totalMass();
     L.body.length   = std::max((maxx-minx)+bodyOverhang, 1.2);
     L.body.width    = std::max((maxz-minz)+bodyMargin,   0.8);
     L.body.height   = bodyHeight;
-    L.body.comX     = comX;
-    L.body.comY     = comY;
-    L.body.comZ     = comZ;
+    L.body.comX     = loadedComX();
+    L.body.comY     = loadedComY();
+    L.body.comZ     = loadedComZ();
     L.body.maxSteer = maxSteer;
 
     double attachY = -bodyHeight*0.5 + attachAboveFloor;
@@ -214,7 +214,16 @@ void ManualDrivetrain::step(double dt, const StepInput& in){
     // ---- driver input ------------------------------------------------------
     clu.engagement = clampd(in.cmd.clutch, 0.0, 1.0);
     // no reverse gear is modelled, so the API's -1 lands in neutral
-    box.gear = in.cmd.gear <= 0 ? 0 : std::min(in.cmd.gear, box.gears());
+    int newGear = in.cmd.gear <= 0 ? 0 : std::min(in.cmd.gear, box.gears());
+    // A ratio change invalidates the lock.  While locked the engine has no
+    // equation of motion of its own -- integrate() defines it as omegaCarrier*n
+    // -- so swapping n underneath a locked clutch teleports the crank to the new
+    // ratio in a single substep (4300 -> 2470 rpm on a 1-2 shift), bypassing the
+    // flywheel entirely.  Dropping the lock forces the clutch to re-synchronise
+    // through clu.torque(), which is what actually makes a clutchless shift
+    // crunch and take time.
+    if(newGear != box.gear) clu.locked = false;
+    box.gear = newGear;
 
     double steerCmd = clampd(in.cmd.steer, -1.0, 1.0);
     for(WheelState& wh : wheels)
@@ -256,17 +265,28 @@ void ManualDrivetrain::integrate(double dt,double throttle,double brake){
 
     // --- weight: distribute static load, then transfer front<->rear on accel
     // (skipped in external mode -- the 3D suspension supplies each wheel's Fz)
-    double Wt = mass*g;
+    double M  = totalMass();          // kerb + payload
+    double Wt = M*g;
     if(!external){
-        double staticEach= Wt/N;
-        double dFz       = mass*accel*cgH/wheelbase;   // transferred front->rear
-        int nf=0,nr=0;
-        for(const WheelState& wh: wheels){ if(wh.px>0) nf++; else nr++; }
-        for(WheelState& wh: wheels){
-            double t = 0.0;
-            if(wh.px>0 && nf>0) t = -dFz/nf;           // front sheds load
-            else if(wh.px<=0 && nr>0) t = +dFz/nr;     // rear gains load
-            wh.Fz = clampd(staticEach + t, 0.0, 1e6);
+        // Static split is taken about the CoM rather than shared equally, so
+        // that payload loaded behind the axle line actually makes the van
+        // tail-heavy.  Empty, the 0.16 m forward CoM gives the documented
+        // ~55/45; at 2.5 t in the back it goes past 35/65.
+        int nf=0,nr=0; double pxF=0.0,pxR=0.0;
+        for(const WheelState& wh: wheels){
+            if(wh.px>0){ nf++; pxF+=wh.px; } else { nr++; pxR+=wh.px; }
+        }
+        if(nf>0 && nr>0){
+            pxF/=nf; pxR/=nr;
+            double wb  = std::max(1e-3, pxF-pxR);
+            double f   = clampd((loadedComX()-pxR)/wb, 0.05, 0.95);  // front share
+            double dFz = M*accel*loadedCgH()/wheelbase;   // transferred front->rear
+            for(WheelState& wh: wheels)
+                wh.Fz = clampd(wh.px>0 ? (Wt*f       - dFz)/nf     // front sheds
+                                       : (Wt*(1.0-f) + dFz)/nr,    // rear gains
+                               0.0, 1e6);
+        } else {
+            for(WheelState& wh: wheels) wh.Fz = Wt/N;   // degenerate layout
         }
     }
 
@@ -471,7 +491,7 @@ void ManualDrivetrain::integrate(double dt,double throttle,double brake){
         double drag = 0.5*rho*Cd*A*v*std::fabs(v);
         double roll = Crr*Wt*sgn(v);
         double net  = Fx_total - drag - roll;
-        accel = net/mass;
+        accel = net/M;
         v    += dt*accel;
         if(std::fabs(v)<1e-3 && std::fabs(net)<roll+1.0) v=0.0; // settle at rest
         x    += dt*v;

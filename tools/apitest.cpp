@@ -120,17 +120,66 @@ int main(){
     {
         Rig r;
         char d[160];
-        std::snprintf(d,sizeof d,"L %.2f W %.2f H %.2f, %d wheels, %d driven, com %.2f/%.2f",
+        std::snprintf(d,sizeof d,"L %.2f W %.2f H %.2f, %d wheels, %d driven, attach py %.3f",
                       r.rig.body.length,r.rig.body.width,r.rig.body.height,
                       (int)r.rig.wheels.size(),r.sim.telemetry().drivenWheels,
-                      r.rig.body.comX,r.rig.body.comY);
+                      r.rig.wheels[0].py);
         bool ok = std::fabs(r.rig.body.length-5.68)<1e-6
                && std::fabs(r.rig.body.width -1.97)<1e-6
                && std::fabs(r.rig.body.height-2.05)<1e-6
                && r.rig.wheels.size()==4
-               && std::fabs(r.rig.wheels[0].py-(-0.525))<1e-6
+               && std::fabs(r.rig.wheels[0].py-(-0.705))<1e-6
                && r.rig.wheels[0].steerable && !r.rig.wheels[2].steerable;
-        check(ok, "layout() matches the old hard-coded rig", d);
+        check(ok, "layout(): body box and suspension attach points", d);
+    }
+
+    // ---- E: a shift must not teleport engine speed -----------------------
+    // While the clutch is locked the engine has no equation of motion of its
+    // own, so a ratio change used to redefine crank speed in a single substep.
+    {
+        vsim::ManualDrivetrain d;            // standalone 1D is enough here
+        vsim::StepInput in;
+        d.reset(); in.cmd.throttle=0.6; in.cmd.gear=1;
+        double c=0.0;
+        for(int i=0;i<900;i++){ c=std::min(1.0,c+1.0/240.0); in.cmd.clutch=c;
+                                d.step(1.0/60.0,in); }
+        double before = d.telemetry().engineRPM;
+        in.cmd.gear=2;                        // clutchless money shift
+        d.step(1.0/60.0,in);
+        double jump = std::fabs(d.telemetry().engineRPM - before);
+        int frames=1;
+        while(frames<120 && !d.telemetry().clutchLocked){ d.step(1.0/60.0,in); frames++; }
+        vsim::Telemetry t = d.telemetry();
+        char dsc[160];
+        std::snprintf(dsc,sizeof dsc,"%.0f -> %.0f rpm, %.0f rpm in frame 1, relocked in %d",
+                      before,t.engineRPM,jump,frames);
+        check(jump < 400.0 && t.clutchLocked && frames>3,
+              "clutchless shift: rpm slews, does not teleport", dsc);
+    }
+
+    // ---- F: payload changes total mass, CoM and the static axle split -----
+    {
+        vsim::ManualDrivetrain d;
+        vsim::StepInput in; in.cmd.gear=0; in.cmd.clutch=0;
+        auto rearShare=[&](double kg){
+            d.payload=kg; d.reset();
+            for(int i=0;i<10;i++) d.step(1.0/60.0,in);   // let the loads settle
+            const vsim::WheelOut* w=d.wheelOutputs();
+            double f=w[0].Fz+w[1].Fz, r=w[2].Fz+w[3].Fz;
+            return (f+r)>1.0 ? r/(f+r) : 0.0;
+        };
+        double empty = rearShare(0.0);
+        double laden = rearShare(vsim::loadModePayload(vsim::LOAD_LADEN));
+        double over  = rearShare(vsim::loadModePayload(vsim::LOAD_OVER));
+        vsim::Layout L = d.layout();                     // still at LOAD_OVER
+        char dsc[176];
+        std::snprintf(dsc,sizeof dsc,"rear %.0f%% -> %.0f%% -> %.0f%%, 2.5t total %.0f kg, cgH %.2f -> %.2f m",
+                      empty*100,laden*100,over*100,L.body.mass,d.cgH,d.loadedCgH());
+        // cargo sits on the load floor, below the kerb CoM, so the CoM settles
+        // a little -- but with twice the mass the roll moment still grows
+        check(std::fabs(empty-0.452)<0.01 && laden>empty && over>laden
+              && std::fabs(L.body.mass-4850.0)<1e-6 && d.loadedCgH()<d.cgH,
+              "payload: adds mass, moves the CoM aft and loads the rear", dsc);
     }
 
     std::printf("\n%s (%d failure%s)\n", fails? "FAILED":"ALL PASSED", fails, fails==1?"":"s");

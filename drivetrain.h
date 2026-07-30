@@ -139,6 +139,20 @@ struct Differential {
     }
 };
 
+// ----------------------------- load state -----------------------------------
+// Named payload steps for the host UI.  These are PAYLOAD only -- the kerb mass
+// is a separate parameter, so "laden" means kerb + this.
+enum LoadMode { LOAD_EMPTY=0, LOAD_HALF=1, LOAD_LADEN=2, LOAD_OVER=3 };
+
+inline double loadModePayload(int mode){
+    switch(mode){
+        case LOAD_HALF:  return  575.0;   // half a legal payload
+        case LOAD_LADEN: return 1150.0;   // right on the 3500 kg GVM
+        case LOAD_OVER:  return 2500.0;   // 2.5 t: way over, and it shows
+        default:         return    0.0;   // empty
+    }
+}
+
 // ----------------------------- the vehicle ----------------------------------
 // Ford Transit Mk7 330M (MWB, medium roof), RWD, unladen.
 class ManualDrivetrain final : public IVehicleSim {
@@ -164,15 +178,46 @@ public:
     double bodyOverhang = 2.38;   // added to the wheelbase to get the box length
     double bodyMargin   = 0.25;   // added to the track to get the box width
     double bodyHeight   = 2.05;
-    // the box is centred on the body origin, so the suspension tops hang 0.50 m
-    // above its underside -- that puts the wheels below the floor and leaves
-    // ~0.20 m of ground clearance.
-    double attachAboveFloor = 0.50;
+    // How far the suspension tops sit above the underside of the box, i.e. the
+    // box floor is this far BELOW the attach points -- so smaller = body rides
+    // higher.  With the unladen springs settling at 0.32 m the attach points sit
+    // 0.667 m up, giving 0.667 - 0.32 = ~0.35 m of clearance: the box floor
+    // clears the wheel centres instead of swallowing the wheels to the axle.
+    double attachAboveFloor = 0.32;
     // CoM relative to the box centre: forward of centre for the front-mounted
     // engine (~55/45 unladen split) and low enough to sit about 0.74 m above the
     // road -- a rollover threshold of ~1.16 g on a 1.72 m track.
     double comX = 0.16, comY = -0.45, comZ = 0.0;
     double maxSteer = 0.6283185307;   // 36 deg -> ~11.7 m turning circle
+
+    // ---- payload ------------------------------------------------------------
+    // `mass` above is the KERB mass, i.e. the empty van.  Cargo is carried as a
+    // separate lump rather than folded into `mass`, because the two do not act
+    // alike: the load sits low and well behind the kerb CoM, so adding it also
+    // moves the weight distribution and the CoM height, not just the total.
+    // Everything downstream therefore uses totalMass()/loadedCom*()/loadedCgH()
+    // instead of mass/com*/cgH.
+    //
+    // A 330M's 3500 kg GVM over a 2350 kg kerb leaves 1150 kg of legal payload;
+    // LOAD_OVER goes to 2.5 t so an overloaded van can be felt squatting onto
+    // its bump stops, going tail-heavy and running out of rear grip.
+    double payload  = 0.0;      // cargo in the load bay [kg]
+    double payloadX = -0.55;    // its centroid rel. to the box centre [m]:
+    double payloadY = -0.55;    // behind the middle, down on the load floor
+    double payloadZ =  0.0;
+
+    double totalMass() const { return mass + payload; }
+    // mass-weighted blend of a kerb value and a payload value
+    double loadBlend(double kerb,double load) const {
+        double m = totalMass();
+        return m > 1e-9 ? (mass*kerb + payload*load)/m : kerb;
+    }
+    double loadedComX() const { return loadBlend(comX,payloadX); }
+    double loadedComY() const { return loadBlend(comY,payloadY); }
+    double loadedComZ() const { return loadBlend(comZ,payloadZ); }
+    // CoM height over the road.  comY is measured from the box centre, so the
+    // loaded CoM moves by exactly how far the blend shifted it.
+    double loadedCgH()  const { return cgH + (loadedComY() - comY); }
 
     // ---- drivetrain --------------------------------------------------------
     Engine  eng;
