@@ -54,6 +54,35 @@ struct TrackOut {
     float contactSpeed = 0;  // mean along-forward ground speed at contacts [m/s]
 };
 
+// ----- water / buoyancy -----------------------------------------------------
+// The world has ONE flat water plane at `level`.  A floating body is modelled
+// as a grid of sample points spread through its hull envelope; each point owns
+// an equal share of `volume` and, when it goes under, pushes up with
+//   rho*g * (volume/N) * submergedFraction
+// applied AT THAT POINT -- so a hull half on a ramp gets lift only on the
+// submerged corners and pitches up by itself.  That is what makes the
+// terrain <-> water transition fall out for free instead of being special-cased.
+struct Buoy {
+    bool  enabled   = true;
+    float level     = -1.5f;     // water surface height [m]
+    float volume    = 20.0f;     // displaced volume when fully under [m^3]
+    float linDrag   = 6000.0f;   // horizontal water resistance [N per m/s]
+    float heaveDamp = 60000.0f;  // vertical damping [N per m/s] (kills bobbing)
+    float angDrag   = 25000.0f;  // angular water resistance [Nm per rad/s]
+    float paddle    = 4500.0f;   // track-paddle thrust [N per m/s of track speed]
+    float paddleCap = 5.0f;      // track speed beyond which the track just churns
+                                 //   [m/s] -- a paddling track has limited bite, so
+                                 //   revving it out in 4th does NOT make it swim faster
+};
+
+// ----- one buoyancy sample point, read back for debug visualization ---------
+struct BuoyPoint {
+    float x=0,y=0,z=0;     // sample position, world
+    float sub=0;           // 0 (dry) .. 1 (fully submerged)
+    float fx=0,fy=0,fz=0;  // buoyant force applied here [N]
+    float dx=0,dy=0,dz=0;  // water drag force applied here [N]
+};
+
 // ----- per-wheel output (world space) ---------------------------------------
 struct WheelOut {
     float x=0,y=0,z=0;   // wheel centre, world
@@ -152,6 +181,15 @@ public:
                    float comX=0, float comY=0, float comZ=0);
     void setTrackSusp(const TrackSusp& s);
 
+    // ----- water ----------------------------------------------------------
+    // Buoyancy sample points are laid out by buildTank() from the hull box;
+    // setBuoy() only tunes the water plane and the force coefficients, so it
+    // can be called at any time (including every frame from a UI).
+    void        setBuoy(const Buoy& b);
+    const Buoy& buoy() const;
+    // valid after each stepTank(); empty until a tank has been built
+    const std::vector<BuoyPoint>& buoyPoints() const { return bpts_; }
+
     // ----- raycast car rig (no Jolt vehicle controller) -------------------
     // Same chassis + wheel layout as buildVehicle(), but nothing drives the
     // wheels: Jolt just provides the rigid body, the suspension raycasts and
@@ -207,6 +245,7 @@ private:
     struct Impl;
     Impl* p_;
     std::vector<WheelOut>    wout_;
+    std::vector<BuoyPoint>   bpts_;
     std::vector<ObstacleOut> obs_;
 };
 

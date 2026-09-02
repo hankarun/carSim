@@ -149,6 +149,11 @@ struct World::Impl {
     bool  stalled    = false;
     float stallT     = 0.0f;         // how long we've been below stall speed [s]
 
+    // water / buoyancy
+    Buoy               buoy;
+    std::vector<Vec3>  buoyLocal;  // sample points, body space
+    float              buoySlabH = 1.0f;  // vertical extent one point stands for [m]
+
     // tank track state
     std::vector<char> trackSide;   // per ray: 0 = left track, 1 = right track
     TrackSusp         tsusp;
@@ -578,6 +583,34 @@ void World::buildTank(int roadWheelsPerSide, float x0, float x1,
     p_->isTank = true;
     p_->tout[0]=TrackOut{}; p_->tout[1]=TrackOut{};
 
+    // ---- buoyancy sample grid ------------------------------------------
+    // 3 (X) x 2 (Y) x 2 (Z) points through the hull ENVELOPE, which is bigger
+    // than the collision box: a real tank displaces its sponsons and its two
+    // track runs as well as the hull, and the tracks hang below the box, so the
+    // envelope is also shifted down.  Points sit at slab centres, not on the
+    // faces, so each one stands for an equal share of the volume around it.
+    {
+        const int NX=3, NY=2, NZ=2;
+        float hx = bodyLen*0.58f;               // envelope half-extents
+        float hy = bodyHei*0.80f;
+        float hz = bodyWid*0.72f;
+        float cy = -bodyHei*0.25f;              // envelope centre (tracks hang low)
+        p_->buoyLocal.clear();
+        p_->buoyLocal.reserve(NX*NY*NZ);
+        auto slabCentre=[](int k,int n,float half){
+            // k-th of n equal slabs spanning [-half,+half], at its centre
+            return -half + (2.0f*half)*((float)k+0.5f)/(float)n;
+        };
+        for(int i=0;i<NX;i++) for(int j=0;j<NY;j++) for(int k=0;k<NZ;k++)
+            p_->buoyLocal.push_back(Vec3(slabCentre(i,NX,hx),
+                                         cy+slabCentre(j,NY,hy),
+                                         slabCentre(k,NZ,hz)));
+        // how tall a slice one point represents -- the depth over which its
+        // submersion ramps 0 -> 1, which is what keeps the lift continuous
+        p_->buoySlabH = std::max(0.05f, 2.0f*hy/(float)NY);
+        bpts_.assign(p_->buoyLocal.size(), BuoyPoint{});
+    }
+
     // box hull, wrapped so its centre of mass can be shifted (body space)
     BoxShapeSettings boxS(Vec3(bodyLen*0.5f, bodyHei*0.5f, bodyWid*0.5f));
     ShapeRefC boxShape = boxS.Create().Get();
@@ -599,6 +632,8 @@ void World::buildTank(int roadWheelsPerSide, float x0, float x1,
 }
 
 void World::setTrackSusp(const TrackSusp& s){ p_->tsusp=s; }
+void World::setBuoy(const Buoy& b){ p_->buoy=b; }
+const Buoy& World::buoy() const { return p_->buoy; }
 const TrackOut& World::track(int side) const { return p_->tout[side&1]; }
 
 void World::stepTank(float dt, float leftSurf, float rightSurf,
@@ -693,6 +728,75 @@ void World::stepTank(float dt, float leftSurf, float rightSurf,
         for(int t=0;t<2;t++)
             if(p_->tout[t].groundedRays>0)
                 p_->tout[t].contactSpeed /= (float)p_->tout[t].groundedRays;
+
+        // ---- water: buoyancy, drag and track paddling ---------------------
+        // Runs AFTER the suspension so the two just add up.  Nothing here is
+        // conditional on "being in the lake": every point simply asks how deep
+        // it is, which is exactly why driving down a ramp into the water is a
+        // smooth handover -- the front points get lift first and the springs
+        // unload themselves as the hull starts to swim.
+        const Buoy& bo = p_->buoy;
+        float subAvg = 0.0f;
+        if(bo.enabled && !p_->buoyLocal.empty()){
+            const size_t N   = p_->buoyLocal.size();
+            const float  rhoG = 9810.0f;             // rho*g  [N/m^3]
+            const float  Vi   = bo.volume/(float)N;  // volume one point carries
+            const float  half = 0.5f*p_->buoySlabH;
+            const float  kLin = bo.linDrag  /(float)N;
+            const float  kHev = bo.heaveDamp/(float)N;
+
+            for(size_t i=0;i<N;++i){
+                RVec3 pw  = bp + bq*p_->buoyLocal[i];
+                Vec3  pwv = Vec3(pw);
+                // fraction of this point's slab that is under the surface
+                float sub = (bo.level - (pwv.GetY()-half)) / p_->buoySlabH;
+                sub = std::max(0.0f, std::min(1.0f, sub));
+
+                BuoyPoint& op = bpts_[i];
+                op.x=pwv.GetX(); op.y=pwv.GetY(); op.z=pwv.GetZ(); op.sub=sub;
+                op.fx=op.fy=op.fz=0; op.dx=op.dy=op.dz=0;
+                subAvg += sub;
+                if(sub<=0.0f) continue;
+
+                Vec3 Fb(0.0f, rhoG*Vi*sub, 0.0f);
+                bi.AddForce(p_->chassis, Fb, pw);
+                op.fy = Fb.GetY();
+
+                // drag: horizontal resistance sets the swimming top speed,
+                // the (much stiffer) vertical term stops the hull pogoing on
+                // the surface -- buoyancy alone is an undamped spring.
+                Vec3 v  = bi.GetPointVelocity(p_->chassis, pw);
+                Vec3 Fd(-kLin*sub*v.GetX(),
+                        -kHev*sub*v.GetY(),
+                        -kLin*sub*v.GetZ());
+                bi.AddForce(p_->chassis, Fd, pw);
+                op.dx=Fd.GetX(); op.dy=Fd.GetY(); op.dz=Fd.GetZ();
+            }
+            subAvg /= (float)N;
+
+            if(subAvg>0.0f){
+                // angular water resistance (yaw/roll/pitch alike)
+                bi.AddTorque(p_->chassis,
+                             bi.GetAngularVelocity(p_->chassis)*(-bo.angDrag*subAvg));
+
+                // track paddling: submerged tracks throw water backwards, which
+                // is how an amphibious tank swims.  Applying it per side at that
+                // track's own Z keeps skid-steer working afloat.
+                for(int side=0; side<2; ++side){
+                    float surf = side==0 ? leftSurf : rightSurf;
+                    if(std::fabs(surf)<1e-3f) continue;
+                    surf = std::max(-bo.paddleCap, std::min(bo.paddleCap, surf));
+                    float zc=0.0f; int n=0;
+                    for(size_t i=0;i<p_->oz.size();++i)
+                        if(p_->trackSide[i]==side){ zc+=p_->oz[i]; n++; }
+                    if(n) zc/=(float)n;
+                    RVec3 at = bp + bq*Vec3(-p_->bodyLen*0.25f, p_->oy.empty()?0.0f:p_->oy[0], zc);
+                    bi.AddForce(p_->chassis, fwd*(bo.paddle*surf*subAvg*0.5f), at);
+                }
+            }
+        } else {
+            for(size_t i=0;i<bpts_.size();++i) bpts_[i]=BuoyPoint{};
+        }
     }
 
     p_->sys.Update(dt, 4, p_->temp, p_->jobs);   // 4 substeps for the heavy body
